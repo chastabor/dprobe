@@ -5,6 +5,16 @@ class DprobeError(Exception):
     exit_code = 1
 
 
+class QueryError(DprobeError):
+    """The database rejected a statement, commit or rollback."""
+
+
+class UsageError(DprobeError):
+    """Bad command-line arguments or input."""
+
+    exit_code = 2
+
+
 class ConfigError(DprobeError):
     """Bad config file, unknown label, or missing credentials."""
 

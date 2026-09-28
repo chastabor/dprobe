@@ -1,0 +1,35 @@
+# Copy to dprobe.yaml (git-ignored) or ~/.config/dprobe/config.yaml.
+# chmod 600 it if it holds plaintext passwords.
+
+defaults:
+  format: table        # table, csv, tsv, json, jsonl
+  max_rows: 1000       # row limit for table output
+
+connections:
+  hr-prod:
+    driver: oracle
+    # Passed to oracledb as the dsn: Easy Connect, a tnsnames.ora alias, or a descriptor.
+    url: db1.example.edu:1521/ORCLPDB1
+    user: hr_ro
+    password: ${HR_PROD_PASS}      # ${VAR} is read from the environment when used
+    readonly: true
+
+  sis:
+    driver: mssql
+    # host[:port]/database. Named instance: sqlsrv01\SQLEXPRESS/sis
+    # (unquoted or single-quoted; double quotes need \\).
+    url: sqlsrv01:1433/sis
+    user: svc_report
+    # Runs through the shell; the first line of stdout is the password.
+    password_cmd: secret-tool lookup db sis
+    options:                       # passed straight to pymssql.connect()
+      encryption: require
+      tds_version: "7.4"           # quote it, or YAML reads a number
+      login_timeout: 15
+
+  web:
+    driver: mysql
+    url: web-db:3306/webapp
+    user: app_ro
+    # No password or password_cmd: prompts on the terminal.
+    # For MariaDB add: options: {collation: utf8mb4_general_ci}

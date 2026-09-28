@@ -1,0 +1,27 @@
+[project]
+name = "dprobe"
+version = "0.1.0"
+description = "Run SQL files and inspect tables on Oracle, SQL Server and MySQL"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "mysql-connector-python>=26.7.0",
+    "oracledb>=26.0.1",
+    "pymssql>=2.4.2",
+    "pyyaml>=6.0.3",
+]
+
+[project.scripts]
+dprobe = "dprobe.cli:main"
+
+[build-system]
+requires = ["uv_build>=0.11.21,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+markers = ["integration: needs real databases (see tests/test_integration.py)"]

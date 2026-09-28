@@ -12,7 +12,7 @@ from typing import Any, NoReturn
 
 import yaml
 
-from dprobe.errors import ConfigError, ConnectError, register_secret
+from dprobe.errors import ConfigError, ConnectError, DprobeError, register_secret
 
 CONFIG_ENV = "DPROBE_CONFIG"
 DRIVERS = ("oracle", "mssql", "mysql")
@@ -100,12 +100,24 @@ def find_config(explicit: Path | None = None) -> Path:
     raise ConfigError(f"no config file found (looked for {looked}); use --config or ${CONFIG_ENV}")
 
 
+def read_utf8(path: Path, error: type[DprobeError]) -> str:
+    """Read a text file as UTF-8, raising error for anything unreadable.
+
+    utf-8-sig drops the byte-order mark that Notepad and SSMS write; json.loads
+    would reject it.
+    """
+    try:
+        return path.read_text(encoding="utf-8-sig")
+    except OSError as e:
+        raise error(f"cannot read {path}: {e.strerror}") from e
+    except UnicodeDecodeError:
+        raise error(f'{path} is not UTF-8; save it as UTF-8 (SSMS "Unicode" files are UTF-16)') from None
+
+
 def load_config(explicit: Path | None = None) -> Config:
     path = find_config(explicit)
     try:
-        data = yaml.safe_load(path.read_text())
-    except OSError as e:
-        raise ConfigError(f"cannot read {path}: {e.strerror}") from e
+        data = yaml.safe_load(read_utf8(path, ConfigError))
     except yaml.YAMLError as e:
         raise ConfigError(f"{path}: invalid YAML: {e}") from e
     config = parse_config(data, path)
@@ -287,7 +299,7 @@ def _expand(value: Any, where: str) -> Any:
 def _run_password_cmd(command: str, where: str) -> str:
     # Runs through the shell so pipes and $VARS work. stderr is not captured,
     # so prompts from tools like gpg or op still reach the user.
-    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, text=True)
+    result = subprocess.run(command, shell=True, stdout=subprocess.PIPE, encoding="utf-8")
     if result.returncode != 0:
         raise ConfigError(f"{where}.password_cmd exited with status {result.returncode}")
     # First line only, so multi-line entries (e.g. from `pass show`) work.

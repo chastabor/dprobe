@@ -2,6 +2,7 @@
 
 from abc import ABC, abstractmethod
 from collections.abc import Iterator, Mapping, Sequence
+from dataclasses import dataclass
 from types import ModuleType
 from typing import Any, ClassVar, Self
 
@@ -13,6 +14,34 @@ from dprobe.sqltext import first_keyword
 FETCH_SIZE = 500
 
 _DML = {"INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE"}
+
+
+@dataclass(frozen=True)
+class TableInfo:
+    schema: str
+    name: str
+    type: str  # TABLE or VIEW
+    comment: str | None
+
+
+@dataclass(frozen=True)
+class ColumnInfo:
+    position: int
+    name: str
+    type: str  # as the database would write it, e.g. VARCHAR2(20 CHAR), decimal(10,2)
+    nullable: bool
+    default: str | None  # the default's SQL text, not its value
+    pk: int | None  # position within the primary key
+    extra: str | None  # identity, auto_increment, computed, ...
+    comment: str | None
+
+
+@dataclass(frozen=True)
+class Described:
+    schema: str
+    name: str
+    columns: list[ColumnInfo]
+    synonym: str | None = None  # the name given, when it was an Oracle synonym
 
 
 class Connector(ABC):
@@ -43,10 +72,33 @@ class Connector(ABC):
     def server_version(self) -> str:
         """Product name and version as reported by the server."""
 
+    @abstractmethod
+    def list_tables(self, schema: str | None, like: str | None, views: bool) -> list[TableInfo]:
+        """Tables (and views) in schema, or the connection's default; like is a LIKE pattern, any case."""
+
+    @abstractmethod
+    def describe(self, schema: str | None, name: str) -> Described | None:
+        """Columns of a table or view, resolving name as the database would; None if not found."""
+
+    @abstractmethod
+    def raw_columns(self, table: Described) -> "Result":
+        """The catalog's own column rows for a table found by describe()."""
+
+
     @classmethod
     def prepare(cls, sql: str) -> str:
         """Adjust a statement's text for this database; --native skips this."""
         return sql
+
+    @classmethod
+    def placeholder(cls, name: str) -> tuple[str, str]:
+        """How a :name bind is sent: the text in the SQL and the params key."""
+        return f"%({name})s", name
+
+    @classmethod
+    def identifier(cls, text: str, quoted: bool) -> str:
+        """A name as the catalog stores it. Oracle overrides this to upper-case unquoted names."""
+        return text
 
     def _start_readonly(self) -> None:
         """Begin a read-only transaction; called after connect when readonly is set."""
@@ -94,6 +146,7 @@ class Connector(ABC):
         params: Mapping[str, Any] | Sequence[Any] | None = None,
         *,
         max_rows: int | None = None,
+        fetch_size: int = FETCH_SIZE,
     ) -> "Result":
         """Run one statement.
 
@@ -101,8 +154,7 @@ class Connector(ABC):
         in the text reach the server untouched. max_rows only sizes fetches,
         so the row after it arrives in the same round trip as the rest.
         """
-        size = FETCH_SIZE if max_rows is None else min(max_rows + 1, 10 * FETCH_SIZE)
-        cursor = self._new_cursor(size)
+        cursor = self._new_cursor(fetch_size if max_rows is None else min(max_rows + 1, 10 * FETCH_SIZE))
         try:
             if params is None:
                 cursor.execute(sql)
@@ -134,6 +186,11 @@ class Connector(ABC):
     def __exit__(self, *exc: object) -> None:
         self.close()
 
+    def _catalog(self, sql: str, params: Mapping[str, Any]) -> list[tuple]:
+        """Rows of a catalog query written in the driver's own placeholder style."""
+        # Catalog rows are small and all kept, so large batches save round trips.
+        return list(self.execute(sql, params, fetch_size=10 * FETCH_SIZE).rows())
+
     def _describe(self, error: Exception, sql: str | None) -> str:
         message = self._error_text(error)
         if hint := self._error_hint(error, sql):
@@ -150,8 +207,8 @@ class Connector(ABC):
         clash = sorted(core.keys() & self.config.options.keys())
         if clash:
             raise ConfigError(
-                f"connections.{self.config.label}.options: {', '.join(clash)} "
-                "is already set from url/user/password"
+                f"connections.{self.config.label}.options: dprobe sets {', '.join(clash)} itself "
+                "(from url, user and password, or always, like charset)"
             )
         return {**core, **self.config.options}
 
@@ -178,9 +235,11 @@ class Result:
         self._exhausted = False
         description = cursor.description
         self.columns: list[str] | None = [d[0] for d in description] if description else None
-        rowcount = cursor.rowcount
-        counts_rows = rowcount > 0 or (rowcount == 0 and first_keyword(sql, connector.config.driver) in _DML)
-        self.affected: int | None = rowcount if self.columns is None and counts_rows else None
+        self.affected: int | None = None
+        if self.columns is None:
+            rowcount = cursor.rowcount
+            if rowcount > 0 or (rowcount == 0 and first_keyword(sql, connector.config.driver) in _DML):
+                self.affected = rowcount
 
     def rows(self) -> Iterator[tuple]:
         """Yield rows, fetching in batches.

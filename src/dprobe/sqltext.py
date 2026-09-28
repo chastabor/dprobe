@@ -50,6 +50,33 @@ def first_keyword(sql: str, dialect: str) -> str:
     return match[1].upper() if match else ""
 
 
+def split_name(text: str) -> list[tuple[str, bool]]:
+    """Split a dotted name such as schema.table into (part, quoted) pairs.
+
+    A part may be quoted with "...", [...] or `...`, which keeps its dots and
+    case; a doubled closing character inside is an escaped one.
+    """
+    parts, i = [], 0
+    while True:
+        close = {'"': '"', "[": "]", "`": "`"}.get(text[i : i + 1])
+        if close:
+            end = _quote_end(text, i, close, backslash=False)
+            if text[end - 1 : end] != close or end == i + 1:
+                raise ValueError(f"unterminated quote in {text!r}")
+            parts.append((text[i + 1 : end - 1].replace(close * 2, close), True))
+        else:
+            end = text.find(".", i)
+            end = len(text) if end == -1 else end
+            parts.append((text[i:end].strip(), False))
+        if not parts[-1][0]:
+            raise ValueError(f"empty name in {text!r}")
+        if end == len(text):
+            return parts
+        if text[end] != ".":
+            raise ValueError(f"expected '.' after a quoted name in {text!r}")
+        i = end + 1
+
+
 def remove_trailing_semicolon(sql: str, dialect: str) -> str:
     """Drop the statement's final ";", even when comments follow it."""
     end = _last_code_end(sql, dialect)

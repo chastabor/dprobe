@@ -20,7 +20,7 @@ def write_config(tmp_path):
     def write(text: str, name: str = "dprobe.yaml", mode: int = 0o600) -> Path:
         path = tmp_path / name
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(textwrap.dedent(text))
+        path.write_text(textwrap.dedent(text), encoding="utf-8")
         path.chmod(mode)
         return path
 

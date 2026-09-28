@@ -96,3 +96,19 @@ def test_helpers():
     assert first_keyword("-- c\n  update t set a = 1", "oracle") == "UPDATE"
     assert first_keyword("/* only a comment */", "oracle") == ""
     assert first_keyword("(SELECT 1)", "oracle") == ""
+
+
+@pytest.mark.parametrize(
+    ("text", "parts"),
+    [
+        ("emp", [("emp", False)]),
+        ("hr.emp", [("hr", False), ("emp", False)]),
+        ('"Mixed Case"."a.b"', [("Mixed Case", True), ("a.b", True)]),
+        ("[dbo].[My]]T]", [("dbo", True), ("My]T", True)]),
+        ("`db`.t", [("db", True), ("t", False)]),
+    ],
+)
+def test_split_name(text, parts):
+    from dprobe.sqltext import split_name
+
+    assert split_name(text) == parts

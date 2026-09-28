@@ -85,7 +85,7 @@ def test_max_rows_reports_more():
     ("value", "text", "encoded"),
     [
         (None, "", "null"),
-        (True, "True", "true"),
+        (True, "true", "true"),
         (b"\x00\xff", "0x00ff", '"0x00ff"'),
         (bytearray(b"\x01"), "0x01", '"0x01"'),
         (Decimal("-0.001"), "-0.001", "-0.001"),
@@ -106,7 +106,7 @@ def test_value_conversions(value, text, encoded):
     assert json_value(value) == encoded
 
 
-def test_json_keeps_non_ascii():
+def test_json_writes_utf8_not_escapes():
     assert json_value("naïve ✓") == '"naïve ✓"'
 
 

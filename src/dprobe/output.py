@@ -4,6 +4,7 @@ import csv
 import json
 import math
 from collections.abc import Iterable, Iterator, Sequence
+from dataclasses import astuple, dataclass, fields
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
 from itertools import chain, islice
@@ -13,7 +14,7 @@ _TABLE_ESCAPES = str.maketrans({"\n": "\\n", "\r": "\\r", "\t": "\\t"})
 _BINARY = (bytes, bytearray, memoryview)
 _PLAIN_TEXT = (str, int, float)
 # Shared, because json.dumps() builds a new encoder per call when given options.
-# ensure_ascii=False keeps non-ASCII text readable; output is UTF-8.
+# ensure_ascii=False writes characters as UTF-8 instead of \u escapes.
 _JSON = json.JSONEncoder(ensure_ascii=False, default=str)
 
 
@@ -21,6 +22,22 @@ class Rows(Protocol):
     columns: list[str]
 
     def rows(self) -> Iterator[tuple]: ...
+
+
+@dataclass(frozen=True)
+class Table:
+    """Rows already in memory, such as catalog records."""
+
+    columns: list[str]
+    data: list[tuple]
+
+    def rows(self) -> Iterator[tuple]:
+        return iter(self.data)
+
+    @classmethod
+    def of(cls, records: Iterable[Any], record_type: type) -> "Table":
+        """One column per dataclass field; record_type still names them when records is empty."""
+        return cls([f.name for f in fields(record_type)], [astuple(r) for r in records])
 
 
 def write_result(
@@ -62,7 +79,7 @@ def format_table(columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> str:
 def text_value(value: Any, null: str = "") -> str:
     """Plain-text form of a database value.
 
-    bytes become 0x-prefixed hex; Decimals never use exponent notation; MySQL
+    bools become true/false; bytes become 0x-prefixed hex; Decimals never use exponent notation; MySQL
     SET values join with commas; MySQL TIME and Oracle INTERVAL values
     (timedelta) print as [-]H:MM:SS[.ffffff], hours unbounded.
     """
@@ -70,6 +87,9 @@ def text_value(value: Any, null: str = "") -> str:
         return null
     if type(value) in _PLAIN_TEXT:
         return str(value)
+    if isinstance(value, bool):
+        # Lower-case, matching JSON, rather than Python's True/False.
+        return "true" if value else "false"
     if isinstance(value, timedelta):
         return _format_timedelta(value)
     if isinstance(value, _BINARY):

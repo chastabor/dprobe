@@ -111,6 +111,13 @@ def test_plaintext_password_warning(write_config):
     assert load_config(write_config(BASIC, mode=0o644)).warnings == ()
 
 
+def test_config_must_be_utf8(tmp_path):
+    path = tmp_path / "latin1.yaml"
+    path.write_bytes("connections:\n  a: {driver: mysql, url: h, user: jos\xe9}\n".encode("latin-1"))
+    with pytest.raises(ConfigError, match="is not UTF-8"):
+        load_config(path)
+
+
 def test_expand_env(monkeypatch):
     monkeypatch.setenv("HOST", "db1")
     monkeypatch.setenv("PASS", "s3cret")

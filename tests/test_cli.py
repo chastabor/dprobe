@@ -1,4 +1,5 @@
 import io
+import re
 import json
 import sqlite3
 from types import SimpleNamespace
@@ -7,7 +8,7 @@ import pytest
 
 from dprobe.cli import main
 from dprobe.connectors import REGISTRY
-from dprobe.connectors.base import Connector
+from dprobe.connectors.base import ColumnInfo, Connector, Described, TableInfo
 
 CONFIG = """
     connections:
@@ -44,6 +45,26 @@ class SqliteConnector(Connector):
         # Stand-in for a driver's cleanup, so tests can tell whether it ran.
         return sql.replace("PREPARE_ME", "1")
 
+    @classmethod
+    def placeholder(cls, name):
+        return f":{name}", name
+
+    def list_tables(self, schema, like, views):
+        types = "'table', 'view'" if views else "'table'"
+        sql = (f"SELECT 'main', name, upper(type), NULL FROM sqlite_master WHERE type IN ({types}) "
+               "AND (:pattern IS NULL OR upper(name) LIKE upper(:pattern)) ORDER BY name")
+        return [TableInfo(*row) for row in self._catalog(sql, {"pattern": like})]
+
+    def describe(self, schema, name):
+        sql = ("SELECT cid + 1, name, type, \"notnull\" = 0, dflt_value, nullif(pk, 0), NULL, NULL "
+               "FROM pragma_table_info(:name)")
+        columns = [ColumnInfo(p, n, t, bool(nl), d, pk, e, c)
+                   for p, n, t, nl, d, pk, e, c in self._catalog(sql, {"name": name})]
+        return Described("main", name, columns) if columns else None
+
+    def raw_columns(self, table):
+        return self.execute("SELECT * FROM pragma_table_info(:name)", {"name": table.name})
+
 
 class FailingConnector(SqliteConnector):
     def _import_driver(self):
@@ -58,7 +79,8 @@ def db(monkeypatch, tmp_path, write_config):
     write_config(CONFIG)
     path = tmp_path / "test.db"
     with sqlite3.connect(path) as conn:
-        conn.execute("CREATE TABLE people (id INTEGER, name TEXT, score REAL)")
+        conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'x', score REAL)")
+        conn.execute("CREATE VIEW people_v AS SELECT id FROM people")
         conn.executemany("INSERT INTO people VALUES (?, ?, ?)",
                          [(1, "Ann", 9.5), (2, "Bo", None), (3, "Cy", 7.0)])
     monkeypatch.setattr(SqliteConnector, "database", str(path))
@@ -203,3 +225,109 @@ def test_query_rejects_non_utf8(db, capsys, tmp_path):
     (tmp_path / "u16.sql").write_bytes("SELECT 1".encode("utf-16"))
     assert main(["query", "web", "u16.sql"]) == 2
     assert "is not UTF-8" in capsys.readouterr().err
+
+
+def test_utf8_regardless_of_locale(tmp_path, write_config):
+    # LC_ALL=C with UTF-8 mode off makes Python default to ASCII for files and stdio.
+    import os
+    import subprocess
+    import sys
+
+    write_config("connections:\n  café:\n    driver: mysql\n    url: h/x\n    user: josé\n")
+    env = {**os.environ, "LC_ALL": "C", "PYTHONUTF8": "0", "PYTHONIOENCODING": ""}
+    result = subprocess.run([sys.executable, "-m", "dprobe", "labels"], cwd=tmp_path, env=env,
+                            capture_output=True)
+    assert result.returncode == 0, result.stderr.decode()
+    assert "café   mysql   h/x  josé" in result.stdout.decode("utf-8")
+
+
+def test_query_binds(db, capsys, tmp_path):
+    assert main(["query", "web", "-f", "csv", "-b", "id:int=2",
+                 "-e", "SELECT name FROM people WHERE id = :ID OR name = ':id'"]) == 0
+    assert capsys.readouterr().out == "name\nBo\n"
+    (tmp_path / "b.yaml").write_text("id: 1\nmin: 9\n")
+    assert main(["query", "web", "-f", "csv", "--binds", "b.yaml", "-b", "id:int=3",
+                 "-e", "SELECT name FROM people WHERE id = :id OR score > :min ORDER BY id"]) == 0
+    assert capsys.readouterr().out == "name\nAnn\nCy\n"
+
+
+def test_query_missing_and_unused_binds(db, capsys):
+    assert main(["query", "web", "-e", "SELECT :a, :b, :c", "-b", "b=1"]) == 2
+    assert "no value for :a, :c" in capsys.readouterr().err
+    assert main(["query", "web", "-f", "csv", "-e", "SELECT 1 AS x", "-b", "typo=1"]) == 0
+    assert "warning: the statement has no :typo" in capsys.readouterr().err
+    assert main(["query", "web", "-f", "csv", "-e", "SELECT :a_ AS x", "-b", "a_=1"]) == 0
+    captured = capsys.readouterr()
+    assert (captured.out, "warning" in captured.err) == ("x\n1\n", False)
+
+
+def test_query_native_rejects_binds(db, capsys):
+    assert main(["query", "web", "--native", "-b", "a=1", "-e", "SELECT 1"]) == 2
+    assert "--native sends the SQL as written" in capsys.readouterr().err
+
+
+def test_dry_run_does_not_connect(write_config, capsys):
+    # The real MySQL connector: web-db doesn't resolve, so connecting would fail.
+    write_config(CONFIG)
+    assert main(["query", "web", "--dry-run", "-b", "id:int=7", "-b", "d:date=2024-01-02",
+                 "-b", "s=O'Brien", "-b", "n:null=",
+                 "-e", "SELECT * FROM t WHERE id = :id AND d = :d AND s = :s AND n = :n"]) == 0
+    assert capsys.readouterr().out == (
+        "SELECT * FROM t WHERE id = %(id)s AND d = %(d)s AND s = %(s)s AND n = %(n)s\n"
+        "-- bind id = 7 (int)\n"
+        "-- bind d = 2024-01-02 (date)\n"
+        "-- bind s = \"O'Brien\"\n"
+        "-- bind n = NULL\n"
+    )
+
+
+def test_dry_run_shows_cleanup_and_native(write_config, capsys):
+    write_config(CONFIG)
+    assert main(["query", "hr", "--dry-run", "-e", "SELECT 1 FROM dual;\n/\n"]) == 0
+    assert capsys.readouterr().out == "SELECT 1 FROM dual\n"
+    assert main(["query", "hr", "--dry-run", "--native", "-e", "SELECT :x FROM dual;"]) == 0
+    assert capsys.readouterr().out == "SELECT :x FROM dual;\n"
+
+
+def test_tables(db, capsys):
+    assert main(["tables", "web"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == (
+        "schema  name    type   comment\n"
+        "------  ------  -----  -------\n"
+        "main    people  TABLE  NULL\n"
+    )
+    assert captured.err.startswith("(1 table, ")
+    assert main(["tables", "web", "--views", "--like", "PEOPLE%", "-f", "csv"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "schema,name,type,comment\nmain,people,TABLE,\nmain,people_v,VIEW,\n"
+    assert captured.err.startswith("(1 table, 1 view, ")
+
+
+def test_describe(db, capsys):
+    assert main(["describe", "web", "people", "-f", "json"]) == 0
+    captured = capsys.readouterr()
+    rows = json.loads(captured.out)
+    assert [r["name"] for r in rows] == ["id", "name", "score"]
+    assert rows[1] == {"position": 2, "name": "name", "type": "TEXT", "nullable": False,
+                       "default": "'x'", "pk": None, "extra": None, "comment": None}
+    assert rows[0]["pk"] == 1
+    assert captured.err.startswith("(main.people: 3 columns, ")
+    assert main(["describe", "web", "people", "--raw", "-f", "csv"]) == 0
+    assert capsys.readouterr().out.splitlines()[0] == "cid,name,type,notnull,dflt_value,pk"
+
+
+def test_describe_not_found_suggests(db, capsys):
+    assert main(["describe", "web", "peopl_"]) == 1
+    assert "no table or view peopl_; did you mean main.people?" in capsys.readouterr().err
+    assert main(["describe", "web", "nothing"]) == 1
+    assert capsys.readouterr().err.strip().endswith("no table or view nothing")
+
+
+@pytest.mark.parametrize(
+    ("name", "message"),
+    [("a.b.c", "expected \\[SCHEMA.\\]TABLE"), ('"open', "unterminated quote"), ("a.", "empty name")],
+)
+def test_describe_bad_names(db, capsys, name, message):
+    assert main(["describe", "web", name]) == 2
+    assert re.search(message, capsys.readouterr().err)

@@ -15,7 +15,7 @@ def test_merge_options_and_clash():
     conn = ConnectionConfig(label="a", driver="mysql", url="h", options={"port": 3307, "ssl_disabled": True})
     args = cls(conn, None)._merge_options(host="h", port=None, user="u")
     assert args == {"host": "h", "user": "u", "port": 3307, "ssl_disabled": True}
-    with pytest.raises(ConfigError, match=r"connections\.a\.options: host is already set"):
+    with pytest.raises(ConfigError, match=r"connections\.a\.options: dprobe sets host itself"):
         cls(ConnectionConfig(label="a", driver="mysql", url="h", options={"host": "x"}), None)._merge_options(host="h")
 
 

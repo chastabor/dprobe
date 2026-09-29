@@ -193,3 +193,7 @@ Add `-v` for tracebacks and the config file in use.
 - **Databases:** `-i` starts them with `tests/compose.yaml` and waits until they're healthy. They stay up for the next run, and together need about 5 GB of memory.
 - **Integration config:** the tests use `$DPROBE_IT_CONFIG`, by default `tests/it.example.yaml`, with `tests/it.example.override.yaml` merged in if you add one.
 - **By hand:** `docker compose -f tests/compose.yaml up -d --wait`, then `DPROBE_IT_CONFIG=tests/it.example.yaml uv run pytest`. The design, the reasons behind it and the driver quirks found along the way are in [`plans/dprobe-plan.md`](plans/dprobe-plan.md).
+
+## License
+
+MIT — see [`LICENSE`](LICENSE).

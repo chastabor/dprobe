@@ -1,6 +1,6 @@
 # dprobe
 
-Run SQL files and inspect tables on Oracle, SQL Server and MySQL/MariaDB from the command line. Connections are named in a YAML file, so a query is just `dprobe query hr-prod report.sql`.
+An internal tool to help run SQL files and inspect tables on Oracle, SQL Server and MySQL/MariaDB from the command line. Connections are named in a YAML file, so a query is just `dprobe query hr-prod report.sql`.
 
 - One `:name` bind syntax for every database, with typed values, lists for `IN (:ids)`, defaults declared in the SQL file, and prompts for anything missing.
 - `tables`, `describe`, `indexes` and `schemas` read each database's catalog and print the same columns everywhere.

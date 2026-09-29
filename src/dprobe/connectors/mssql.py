@@ -1,9 +1,11 @@
 import re
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from types import ModuleType
 from typing import Any
 
-from dprobe.connectors.base import ColumnInfo, Connector, Described, Result, TableInfo
+from dprobe.connectors.base import (
+    ColumnInfo, Connector, Found, IndexInfo, Result, ResultColumn, TableInfo, group_indexes,
+)
 from dprobe.sqltext import lex, remove_trailing_line
 
 _DBLIB_HEADER = re.compile(r"DB-Lib error message \d+, severity \d+:")
@@ -40,6 +42,21 @@ ORDER BY c.column_id
 """
 
 
+# One row per index column, included columns last; the LEFT JOINs keep a row for a
+# table without indexes. index_id 0 is the heap, not an index.
+_INDEXES = """
+SELECT s.name, o.name, i.name, i.is_unique, i.is_primary_key, i.type_desc, c.name,
+       ic.is_included_column, ic.is_descending_key
+FROM sys.objects o
+JOIN sys.schemas s ON s.schema_id = o.schema_id
+LEFT JOIN sys.indexes i ON i.object_id = o.object_id AND i.index_id > 0 AND i.is_hypothetical = 0
+LEFT JOIN sys.index_columns ic ON ic.object_id = i.object_id AND ic.index_id = i.index_id
+LEFT JOIN sys.columns c ON c.object_id = ic.object_id AND c.column_id = ic.column_id
+WHERE o.object_id = OBJECT_ID(%(name)s) AND o.type IN ('U', 'V')
+ORDER BY i.name, ic.is_included_column, ic.key_ordinal, ic.index_column_id
+"""
+
+
 class MssqlConnector(Connector):
     """pymssql, which bundles FreeTDS, so no ODBC driver is needed.
 
@@ -49,6 +66,16 @@ class MssqlConnector(Connector):
     SQL Server has no read-only transaction, so readonly only blocks --commit;
     DML still runs and holds locks until the rollback.
     """
+
+    dialect = "mssql"
+    # Schemas of the current database only; 16384-16399 belong to the fixed
+    # database roles (db_owner, ...).
+    _SCHEMAS = """
+SELECT name, CASE WHEN name = SCHEMA_NAME() THEN 1 ELSE 0 END,
+       CASE WHEN name IN ('sys', 'INFORMATION_SCHEMA', 'guest') OR schema_id BETWEEN 16384 AND 16399
+            THEN 1 ELSE 0 END
+FROM sys.schemas ORDER BY name
+"""
 
     def _import_driver(self) -> ModuleType:
         import pymssql
@@ -89,7 +116,7 @@ class MssqlConnector(Connector):
         rows = self._catalog(_TABLES.format(types=types), {"schema": schema, "pattern": like})
         return [TableInfo(*row) for row in rows]
 
-    def describe(self, schema: str | None, name: str) -> Described | None:
+    def describe(self, schema: str | None, name: str) -> Found[ColumnInfo] | None:
         rows = self._catalog(_COLUMNS, {"name": _qualified(schema, name)})
         if not rows:
             return None
@@ -108,9 +135,34 @@ class MssqlConnector(Connector):
                  default, pk, identity, computed, comment) in rows
         ]
         # The schema and name as resolved, e.g. dbo for an unqualified name.
-        return Described(rows[0][0], rows[0][1], columns)
+        return Found(rows[0][0], rows[0][1], columns)
 
-    def raw_columns(self, table: Described) -> Result:
+    def indexes(self, schema: str | None, name: str) -> Found[IndexInfo] | None:
+        rows = self._catalog(_INDEXES, {"name": _qualified(schema, name)})
+        if not rows:
+            return None
+        indexes = group_indexes(
+            (index, unique, primary, type_desc, column, descending, included)
+            for _, _, index, unique, primary, type_desc, column, included, descending in rows
+        )
+        return Found(rows[0][0], rows[0][1], indexes)
+
+    def describe_result(self, sql: str, params: Mapping[str, Any] | None = None) -> list[ResultColumn]:
+        """sp_describe_first_result_set reads the columns without running the query.
+
+        pymssql fills in bind values on the client, so the same substitution
+        turns the statement into the literal text SQL Server describes.
+        """
+        text = sql if params is None else self.driver._mssql.substitute_params(sql, params).decode()
+        rows = self._catalog("EXEC sp_describe_first_result_set @tsql = %(tsql)s", {"tsql": text})
+        # is_hidden, column_ordinal, name, is_nullable, system_type_id, system_type_name,
+        # max_length, precision, scale, ...
+        return [
+            ResultColumn(row[1], row[2] or "", row[5], bool(row[3]), row[6], row[7], row[8])
+            for row in rows if not row[0]
+        ]
+
+    def raw_columns(self, table: Found) -> Result:
         sql = ("SELECT c.*, TYPE_NAME(c.user_type_id) AS type_name FROM sys.columns c "
                "WHERE c.object_id = OBJECT_ID(%(name)s) ORDER BY c.column_id")
         return self.execute(sql, {"name": _qualified(table.schema, table.name)})
@@ -123,11 +175,12 @@ class MssqlConnector(Connector):
         # result set; fetchone() returns None once at the boundary, so stop there.
         return iter(cursor.fetchone, None)
 
-    def _has_more_results(self, cursor: Any) -> bool:
+    def _result_sets(self, cursor: Any) -> Iterator[Any]:
+        # nextset() moves the same cursor on, skipping results without columns.
+        yield from super()._result_sets(cursor)
         while cursor.nextset():
             if cursor.description is not None:
-                return True
-        return False
+                yield cursor
 
 
 def error_text(error: Exception) -> str:

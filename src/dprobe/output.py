@@ -3,7 +3,7 @@
 import csv
 import json
 import math
-from collections.abc import Iterable, Iterator, Sequence
+from collections.abc import Callable, Iterable, Iterator, Sequence
 from dataclasses import astuple, dataclass, fields
 from datetime import date, datetime, time, timedelta
 from decimal import Decimal
@@ -68,6 +68,32 @@ def write_result(
     # Peek one row past the limit to tell the caller the output was cut short.
     more = max_rows is not None and next(rows, None) is not None
     return count, more
+
+
+class ResultWriter:
+    """Writes result sets one after another, opening the output on the first one.
+
+    Opening late means a failed query never creates or empties an output file.
+    table, csv and tsv put a blank line between sets; json writes one array
+    per set (a stream jq reads); jsonl carries on with the rows.
+    """
+
+    def __init__(self, open_output: Callable[[], TextIO], fmt: str, *, null: str | None = None,
+                 max_width: int | None = None) -> None:
+        self._open = open_output
+        self._format = fmt
+        self._null = null
+        self._max_width = max_width
+        self.out: TextIO | None = None
+
+    def write(self, result: Rows, *, max_rows: int | None = None) -> tuple[int, bool]:
+        """As write_result(): (rows written, whether rows were left unread)."""
+        if self.out is None:
+            self.out = self._open()
+        elif self._format in ("table", "csv", "tsv"):
+            self.out.write("\n")
+        return write_result(result, self._format, self.out, null=self._null, max_rows=max_rows,
+                            max_width=self._max_width)
 
 
 def format_table(columns: Sequence[str], rows: Iterable[Sequence[Any]]) -> str:

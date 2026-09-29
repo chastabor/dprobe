@@ -5,14 +5,15 @@ import os
 import re
 import stat
 import subprocess
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
 import yaml
 
-from dprobe.errors import ConfigError, ConnectError, DprobeError, register_secret
+from dprobe import tty
+from dprobe.errors import ConfigError, DprobeError, register_secret
 
 CONFIG_ENV = "DPROBE_CONFIG"
 DRIVERS = ("oracle", "mssql", "mysql")
@@ -20,7 +21,7 @@ FORMATS = ("table", "csv", "tsv", "json", "jsonl")
 
 _TOP_KEYS = ("defaults", "connections")
 _DEFAULT_KEYS = ("format", "max_rows")
-_CONNECTION_KEYS = ("driver", "url", "user", "password", "password_cmd", "readonly", "options")
+_CONNECTION_KEYS = ("driver", "url", "user", "password", "password_cmd", "keyring", "readonly", "options")
 _ENV_REF = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
@@ -32,16 +33,19 @@ class ConnectionConfig:
     user: str | None = None
     password: str | None = field(default=None, repr=False)
     password_cmd: str | None = None
+    keyring: str | None = None  # service name; the password is stored under it for user
     readonly: bool = False
     options: Mapping[str, Any] = field(default_factory=dict)
 
     @property
     def auth_source(self) -> str:
-        """Where the password comes from: env, password, command, prompt or none."""
+        """Where the password comes from: env, password, command, keyring, prompt or none."""
         if self.password is not None:
             return "env" if _ENV_REF.search(self.password) else "password"
         if self.password_cmd is not None:
             return "command"
+        if self.keyring is not None:
+            return "keyring"
         return "prompt" if self.user is not None else "none"
 
     def expand_env(self) -> "ConnectionConfig":
@@ -175,7 +179,7 @@ def parse_host_url(url: str) -> tuple[str, int | None, str | None]:
 
 
 def resolve_password(conn: ConnectionConfig) -> str | None:
-    """Return the password from password, password_cmd, or a terminal prompt.
+    """Return the password from password, password_cmd, keyring, or a terminal prompt.
 
     Pass an expand_env() copy. Returns None when no user is set, leaving
     authentication to the driver options (e.g. an Oracle wallet).
@@ -185,17 +189,61 @@ def resolve_password(conn: ConnectionConfig) -> str | None:
         password = conn.password
     elif conn.password_cmd is not None:
         password = _run_password_cmd(conn.password_cmd, where)
+    elif conn.keyring is not None:
+        password = _with_keyring(conn, lambda keyring: keyring.get_password(conn.keyring, conn.user))
+        if password is None:
+            raise ConfigError(f"{where}: no password in keyring service {conn.keyring!r} for {conn.user}; "
+                              f"store one with: dprobe keyring {conn.label}")
     elif conn.user is None:
         return None
-    elif _can_prompt():
-        try:
-            password = getpass.getpass(f"Password for {conn.user} on {conn.label}: ")
-        except EOFError:
-            raise ConnectError(f"{conn.label}: password prompt cancelled") from None
     else:
-        raise ConfigError(f"{where}: no password or password_cmd, and no terminal to prompt on")
+        password = prompt_password(conn)
     register_secret(password)
     return password
+
+
+def prompt_password(conn: ConnectionConfig) -> str:
+    """Ask for conn's password on the terminal; ConfigError without one or on Ctrl-D."""
+    if not tty.available():
+        raise ConfigError(f"connections.{conn.label}: no password, password_cmd or keyring, "
+                          "and no terminal to prompt on")
+    try:
+        return getpass.getpass(f"Password for {conn.user} on {conn.label}: ")
+    except EOFError:
+        raise ConfigError(f"{conn.label}: password prompt cancelled") from None
+
+
+def store_keyring_password(conn: ConnectionConfig, password: str | None) -> None:
+    """Save password in conn's keyring service under its user; None deletes it.
+
+    Pass an expand_env() copy, so the user matches the one resolve_password() looks up.
+    """
+    if conn.keyring is None:
+        raise ConfigError(f"connections.{conn.label}: set keyring: SERVICE to keep its password in the keyring")
+    if password is None:
+        _with_keyring(conn, lambda keyring: keyring.delete_password(conn.keyring, conn.user))
+    else:
+        _with_keyring(conn, lambda keyring: keyring.set_password(conn.keyring, conn.user, password))
+
+
+def _with_keyring(conn: ConnectionConfig, action: Callable[[Any], Any]) -> Any:
+    """Run action(keyring module), turning its failures into ConfigError.
+
+    keyring is an optional dependency, and headless Linux often has no
+    backend for it (Secret Service needs a desktop session's D-Bus).
+    """
+    where = f"connections.{conn.label}.keyring"
+    try:
+        import keyring
+        import keyring.errors
+    except ImportError:
+        raise ConfigError(f"{where}: the keyring package isn't installed; install dprobe[keyring]") from None
+    try:
+        return action(keyring)
+    except keyring.errors.PasswordDeleteError:
+        raise ConfigError(f"{where}: no password stored for {conn.user}") from None
+    except keyring.errors.KeyringError as e:
+        raise ConfigError(f"{where}: {e} (no usable keyring backend?)") from e
 
 
 class _Validator:
@@ -258,8 +306,11 @@ def _parse_connection(v: _Validator, label: str, raw: Any) -> ConnectionConfig:
             v.fail(f"{where}.url", str(e))
     password = v.string(data.get("password"), f"{where}.password")
     password_cmd = v.string(data.get("password_cmd"), f"{where}.password_cmd")
-    if password is not None and password_cmd is not None:
-        v.fail(where, "set password or password_cmd, not both")
+    keyring = v.string(data.get("keyring"), f"{where}.keyring")
+    if sum(x is not None for x in (password, password_cmd, keyring)) > 1:
+        v.fail(where, "set only one of password, password_cmd and keyring")
+    if keyring is not None and data.get("user") is None:
+        v.fail(where, "keyring needs a user to store the password under")
     readonly = data.get("readonly", False)
     if not isinstance(readonly, bool):
         v.fail(f"{where}.readonly", "must be true or false")
@@ -274,6 +325,7 @@ def _parse_connection(v: _Validator, label: str, raw: Any) -> ConnectionConfig:
         user=v.string(data.get("user"), f"{where}.user"),
         password=password,
         password_cmd=password_cmd,
+        keyring=keyring,
         readonly=readonly,
         options=options,
     )
@@ -307,15 +359,6 @@ def _run_password_cmd(command: str, where: str) -> str:
     if not lines or not lines[0]:
         raise ConfigError(f"{where}.password_cmd printed no password")
     return lines[0]
-
-
-def _can_prompt() -> bool:
-    # getpass reads /dev/tty, so prompting works even when stdin is a pipe.
-    try:
-        with open("/dev/tty"):
-            return True
-    except OSError:
-        return False
 
 
 def _readable_by_others(path: Path) -> bool:

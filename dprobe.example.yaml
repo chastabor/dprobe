@@ -32,4 +32,6 @@ connections:
     url: web-db:3306/webapp
     user: app_ro
     # No password or password_cmd: prompts on the terminal.
+    # Or keep it in the OS keyring (install dprobe[keyring]): keyring: dprobe
+    # and store it once with: dprobe keyring web
     # For MariaDB add: options: {collation: utf8mb4_general_ci}

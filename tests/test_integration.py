@@ -1,10 +1,17 @@
 """Real connections. Set DPROBE_IT_CONFIG to a config whose it-* labels point
 at test databases (it-oracle, it-mssql, it-mysql, ...); each label runs every
-test. The tests create and drop a table named dprobe_it."""
+test. The tests create and drop tables named dprobe_*.
+
+tests/compose.yaml starts all four with the labels in tests/it.example.yaml:
+    docker compose -f tests/compose.yaml up -d --wait
+    DPROBE_IT_CONFIG=tests/it.example.yaml uv run pytest
+"""
 
 import json
 import os
 import re
+import shutil
+import tempfile
 import time
 from contextlib import suppress
 from dataclasses import replace
@@ -18,8 +25,20 @@ from dprobe.config import load_config
 from dprobe.connectors import create_connector
 from dprobe.errors import QueryError
 
-# Resolved at import: the autouse fixture changes the working directory.
-IT_CONFIG = Path(os.environ["DPROBE_IT_CONFIG"]).resolve() if os.environ.get("DPROBE_IT_CONFIG") else None
+
+def _private_copy(path: str) -> Path:
+    """A 0600 copy of the config, made at import, before the fixtures change directory.
+
+    The committed example is world-readable, which would add a plaintext-password
+    warning to the stderr the tests check.
+    """
+    copy = Path(tempfile.mkdtemp()) / "it.yaml"
+    shutil.copy(Path(path).resolve(), copy)
+    copy.chmod(0o600)
+    return copy
+
+
+IT_CONFIG = _private_copy(os.environ["DPROBE_IT_CONFIG"]) if os.environ.get("DPROBE_IT_CONFIG") else None
 
 pytestmark = pytest.mark.integration
 
@@ -138,14 +157,67 @@ def test_readonly_blocks_dml(it):
             db.execute("UPDATE dprobe_it SET name = 'z'")
 
 
-def test_mssql_batch_shows_first_result_set(it):
+def test_mssql_batch_shows_every_result_set(it):
     run, conn = it
     if conn.driver != "mssql":
         pytest.skip("SQL Server only")
-    status, out, err = run("-f", "csv", sql="DECLARE @x int = 5; SELECT @x AS x; SELECT 2 AS y")
+    status, out, err = run("-f", "csv", sql="DECLARE @x int = 5; SELECT @x AS x; UPDATE dprobe_it SET id = id; SELECT 2 AS y")
     assert status == 0, err
-    assert out == "x\n5\n"
-    assert "more result sets" in err
+    assert out == "x\n5\n\ny\n2\n"
+    lines = err.splitlines()
+    assert lines[:2] == ["(result 1: 1 row)", "(result 2: 1 row)"]
+    assert lines[2].startswith("(2 results, ")
+
+
+def test_oracle_implicit_results(it):
+    run, conn = it
+    if conn.driver != "oracle":
+        pytest.skip("Oracle only")
+    block = """DECLARE
+  c1 SYS_REFCURSOR;
+  c2 SYS_REFCURSOR;
+BEGIN
+  OPEN c1 FOR SELECT id, name FROM dprobe_it ORDER BY id;
+  DBMS_SQL.RETURN_RESULT(c1);
+  OPEN c2 FOR SELECT 'x' AS b FROM dual;
+  DBMS_SQL.RETURN_RESULT(c2);
+END;
+/
+"""
+    status, out, err = run("-f", "csv", sql=block)
+    assert status == 0, err
+    assert out == "ID,NAME\n1,a\n2,b\n\nB\nx\n"
+    assert err.splitlines()[:2] == ["(result 1: 2 rows)", "(result 2: 1 row)"]
+
+
+SCRIPTS = {
+    "oracle": "UPDATE dprobe_it SET name = 'z' WHERE id = 1;\nSELECT name FROM dprobe_it ORDER BY id;\n"
+              "BEGIN\n  UPDATE dprobe_it SET name = 'y' WHERE id = 2;\nEND;\n/\n"
+              "SELECT name FROM dprobe_it ORDER BY id\n/\n",
+    "mysql": "UPDATE dprobe_it SET name = 'z' WHERE id = 1;\nSELECT name FROM dprobe_it ORDER BY id;\n"
+             "UPDATE dprobe_it SET name = 'y' WHERE id = 2;\nSELECT name FROM dprobe_it ORDER BY id;\n",
+    "mssql": "UPDATE dprobe_it SET name = 'z' WHERE id = 1\nGO\nSELECT name FROM dprobe_it ORDER BY id\nGO\n"
+             "UPDATE dprobe_it SET name = 'y' WHERE id = 2;\nGO\nSELECT name FROM dprobe_it ORDER BY id\nGO\n",
+}
+
+
+def test_script(it):
+    run, conn = it
+    status, out, err = run("-f", "csv", "--script", sql=SCRIPTS[conn.driver])
+    assert status == 0, err
+    assert out.split("\n\n") == ["name\nz\nb", "name\nz\ny\n"] if conn.driver != "oracle" else [
+        "NAME\nz\nb", "NAME\nz\ny\n"]
+    assert err.splitlines()[-1].startswith("(4 statements; rolled back (use --commit to keep changes), ")
+    status, out, _ = run("-f", "csv", sql="SELECT name FROM dprobe_it ORDER BY id")
+    assert out.split()[1:] == ["a", "b"]
+
+
+def test_list_bind(it):
+    run, conn = it
+    status, out, err = run("-f", "csv", "-b", "ids:int[]=2,1",
+                           sql="SELECT name FROM dprobe_it WHERE id IN (:ids) ORDER BY id")
+    assert status == 0, err
+    assert out.split()[1:] == ["a", "b"]
 
 
 def test_utf8_round_trip(it):
@@ -196,12 +268,17 @@ META_DDL = {
         "COMMENT ON TABLE dprobe_meta IS 'meta table'",
         "COMMENT ON COLUMN dprobe_meta.amount IS 'the amount'",
         "CREATE VIEW dprobe_meta_v AS SELECT id, code FROM dprobe_meta",
+        "CREATE INDEX dprobe_meta_ix ON dprobe_meta (amount DESC)",
+        "CREATE UNIQUE INDEX dprobe_meta_ux ON dprobe_meta (code, amount)",
     ],
     "mysql": [
         "CREATE TABLE dprobe_meta (id INT AUTO_INCREMENT, code VARCHAR(20) NOT NULL DEFAULT 'x',"
         " amount DECIMAL(10,2) COMMENT 'the amount', note TEXT, PRIMARY KEY (id, code))"
         " COMMENT = 'meta table'",
         "CREATE VIEW dprobe_meta_v AS SELECT id, code FROM dprobe_meta",
+        "CREATE INDEX dprobe_meta_ix ON dprobe_meta (amount DESC)",
+        "CREATE UNIQUE INDEX dprobe_meta_ux ON dprobe_meta (code, amount)",
+        "CREATE INDEX dprobe_meta_px ON dprobe_meta (note(10))",
     ],
     "mssql": [
         "CREATE TABLE dprobe_meta (id INT IDENTITY, code NVARCHAR(20) NOT NULL DEFAULT 'x',"
@@ -210,6 +287,8 @@ META_DDL = {
         "EXEC sp_addextendedproperty 'MS_Description', 'the amount', 'SCHEMA', 'dbo', 'TABLE', 'dprobe_meta',"
         " 'COLUMN', 'amount'",
         "CREATE VIEW dprobe_meta_v AS SELECT id, code FROM dprobe_meta",
+        "CREATE INDEX dprobe_meta_ix ON dprobe_meta (amount DESC) INCLUDE (note)",
+        "CREATE UNIQUE INDEX dprobe_meta_ux ON dprobe_meta (code, amount)",
     ],
 }
 TYPES = {
@@ -312,3 +391,70 @@ def test_describe_oracle_public_synonym(it):
         with create_connector(admin) as db:
             db.execute("DROP PUBLIC SYNONYM dprobe_other")
             db.execute("DROP TABLE system.dprobe_other")
+
+
+def test_indexes(meta):
+    run, conn = meta
+    status, out, err = run("-f", "json", "dprobe_meta", command="indexes")
+    assert status == 0, err
+    found = [(i["name"].lower(), i["columns"].lower(), i["unique"], i["primary"], i["include"])
+             for i in json.loads(out)]
+    primary, *others = found
+    assert primary[1:4] == ("id, code", True, True)
+    expected = [("dprobe_meta_ix", "amount desc", False, False, "note" if conn.driver == "mssql" else None),
+                ("dprobe_meta_ux", "code, amount", True, False, None)]
+    if conn.driver == "mysql":
+        expected.insert(1, ("dprobe_meta_px", "note(10)", False, False, None))
+    assert others == expected
+
+
+def test_indexes_of_a_table_without_any(it):
+    run, conn = it
+    status, out, err = run("-f", "json", "dprobe_it", command="indexes")
+    assert (status, json.loads(out)) == (0, [])
+    assert ": 0 indexes, " in err
+
+
+def test_schemas(it):
+    run, conn = it
+    status, out, err = run("-f", "json", command="schemas")
+    assert status == 0, err
+    schemas = json.loads(out)
+    current = [s["name"] for s in schemas if s["current"]]
+    assert [c.lower() for c in current] == [{"oracle": "prober", "mysql": "probe", "mssql": "dbo"}[conn.driver]]
+    assert not any(s["system"] for s in schemas)
+    status, out, err = run("-f", "json", "--all", command="schemas")
+    system = {s["name"].lower() for s in json.loads(out) if s["system"]}
+    # A MySQL user only sees schemas it has privileges on; information_schema is always there.
+    assert {"oracle": "sys", "mysql": "information_schema", "mssql": "sys"}[conn.driver] in system
+
+
+def test_meta(it):
+    run, conn = it
+    status, out, err = run("-f", "json", "--meta", "-b", "id:int=1",
+                           sql="SELECT id, name FROM dprobe_it WHERE id = :id")
+    assert status == 0, err
+    columns = json.loads(out)
+    assert [c["name"].lower() for c in columns] == ["id", "name"]
+    expected = {"oracle": ["NUMBER", "VARCHAR"], "mssql": ["int", "varchar(20)"], "mysql": ["LONG", "VAR_STRING"]}
+    assert [c["type"] for c in columns] == expected[conn.driver]
+    assert err.startswith("(2 result columns, ")
+
+
+def test_meta_does_not_run_other_statements(it):
+    run, conn = it
+    status, _, err = run("--meta", sql="UPDATE dprobe_it SET name = 'z'")
+    if conn.driver == "mysql":
+        assert status == 2 and "only takes a query" in err
+    else:
+        # Oracle parses and SQL Server describes without running anything.
+        assert status == 0 and err.startswith("(no result columns, ")
+    status, out, _ = run("-f", "csv", "--commit", sql="SELECT name FROM dprobe_it ORDER BY id")
+    assert out.split()[1:] == ["a", "b"]
+
+
+def test_declared_binds(it):
+    run, conn = it
+    status, out, err = run("-f", "csv", sql="-- @bind id int = 2\nSELECT name FROM dprobe_it WHERE id = :id")
+    assert status == 0, err
+    assert out.split()[1:] == ["b"]

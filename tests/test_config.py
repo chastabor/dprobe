@@ -64,7 +64,7 @@ def test_unknown_label(write_config):
         ("driver: mysql\n    url: h/d\n    password: 12345", r"password: must be a string; put 12345 in quotes"),
         ("driver: mysql\n    url: mysql://h/d", r"url: expected host\[:port\]/database without a scheme"),
         ("driver: mssql\n    url: h:99999/d", r"url: invalid port '99999'"),
-        ("driver: mysql\n    url: h/d\n    password: a\n    password_cmd: b", "not both"),
+        ("driver: mysql\n    url: h/d\n    password: a\n    password_cmd: b", "set only one of password"),
         ("driver: mysql\n    url: h/d\n    readonly: maybe", r"readonly: must be true or false"),
         ("driver: mysql\n    url: h/d\n    options: [1]", r"options: expected a mapping"),
     ],
@@ -163,6 +163,40 @@ def test_resolve_password_without_terminal():
 def test_resolve_password_prompts(monkeypatch):
     from dprobe import config
 
-    monkeypatch.setattr(config, "_can_prompt", lambda: True)
+    monkeypatch.setattr(config.tty, "available", lambda: True)
     monkeypatch.setattr(config.getpass, "getpass", lambda prompt: "typed-pw")
     assert resolve_password(_conn(user="u")) == "typed-pw"
+
+
+def test_keyring_password(memory_keyring):
+    from dprobe.config import store_keyring_password
+
+    conn = _conn(user="u", keyring="dprobe")
+    assert conn.auth_source == "keyring"
+    with pytest.raises(ConfigError, match="no password in keyring service 'dprobe' for u; store one with: dprobe keyring a"):
+        resolve_password(conn)
+    store_keyring_password(conn, "kr-secret")
+    assert resolve_password(conn) == "kr-secret"
+    assert redact("x kr-secret y") == "x *** y"
+    store_keyring_password(conn, None)
+    with pytest.raises(ConfigError, match="no password stored for u"):
+        store_keyring_password(conn, None)
+
+
+def test_keyring_without_backend(monkeypatch):
+    import keyring
+    import keyring.backends.fail
+
+    monkeypatch.setattr(keyring, "get_password", keyring.backends.fail.Keyring().get_password)
+    with pytest.raises(ConfigError, match="no usable keyring backend"):
+        resolve_password(_conn(user="u", keyring="dprobe"))
+
+
+@pytest.mark.parametrize(
+    ("entry", "message"),
+    [("driver: mysql\n    url: h/d\n    user: u\n    keyring: s\n    password: p", "set only one of password"),
+     ("driver: mysql\n    url: h/d\n    keyring: s", "keyring needs a user")],
+)
+def test_keyring_config_errors(write_config, entry, message):
+    with pytest.raises(ConfigError, match=message):
+        load_config(write_config(f"connections:\n  web:\n    {entry}\n"))

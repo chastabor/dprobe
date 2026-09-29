@@ -1,19 +1,20 @@
 """Shared behavior for the driver-specific connectors."""
 
 from abc import ABC, abstractmethod
-from collections.abc import Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from collections.abc import Iterable, Iterator, Mapping, Sequence
+from dataclasses import dataclass, replace
 from types import ModuleType
 from typing import Any, ClassVar, Self
 
 from dprobe.config import ConnectionConfig, parse_host_url
-from dprobe.errors import ConfigError, ConnectError, QueryError
-from dprobe.sqltext import first_keyword
+from dprobe.errors import ConfigError, ConnectError, QueryError, UsageError
+from dprobe.sqltext import first_keyword, has_code, split_statements
 
 # Rows per fetchmany() round trip; pymssql and mysql-connector default to 1.
 FETCH_SIZE = 500
 
 _DML = {"INSERT", "UPDATE", "DELETE", "MERGE", "REPLACE"}
+_READS = {"SELECT", "WITH", "VALUES", "TABLE", "SHOW", "DESC", "DESCRIBE", "EXPLAIN"}
 
 
 @dataclass(frozen=True)
@@ -37,10 +38,40 @@ class ColumnInfo:
 
 
 @dataclass(frozen=True)
-class Described:
+class IndexInfo:
+    name: str
+    columns: str  # in key order, e.g. "id, created DESC"; expressions and prefix lengths as written
+    unique: bool
+    primary: bool
+    type: str | None  # NORMAL, BITMAP, BTREE, CLUSTERED, ...
+    include: str | None  # SQL Server included (non-key) columns
+
+
+@dataclass(frozen=True)
+class SchemaInfo:
+    name: str
+    current: bool
+    system: bool  # created and maintained by the database itself
+
+
+@dataclass(frozen=True)
+class ResultColumn:
+    position: int
+    name: str
+    type: str  # the driver's type name; SQL Server gives the full SQL type
+    nullable: bool | None  # None when the driver doesn't say
+    size: int | None
+    precision: int | None
+    scale: int | None
+
+
+@dataclass(frozen=True)
+class Found[T]:
+    """Rows about one table, e.g. its columns, as found by name."""
+
     schema: str
     name: str
-    columns: list[ColumnInfo]
+    items: list[T]
     synonym: str | None = None  # the name given, when it was an Oracle synonym
 
 
@@ -51,8 +82,12 @@ class Connector(ABC):
     and servers all discard an open transaction on disconnect.
     """
 
+    # SQL lexing rules: "oracle", "mssql" or "mysql".
+    dialect: ClassVar[str]
     # DDL that commits implicitly can't be undone by the rollback.
     ddl_autocommits: ClassVar[bool] = False
+    # (name, current, system) per schema, for schemas().
+    _SCHEMAS: ClassVar[str]
 
     def __init__(self, config: ConnectionConfig, password: str | None) -> None:
         self.config = config
@@ -77,18 +112,56 @@ class Connector(ABC):
         """Tables (and views) in schema, or the connection's default; like is a LIKE pattern, any case."""
 
     @abstractmethod
-    def describe(self, schema: str | None, name: str) -> Described | None:
+    def describe(self, schema: str | None, name: str) -> Found[ColumnInfo] | None:
         """Columns of a table or view, resolving name as the database would; None if not found."""
 
     @abstractmethod
-    def raw_columns(self, table: Described) -> "Result":
+    def raw_columns(self, table: Found) -> "Result":
         """The catalog's own column rows for a table found by describe()."""
+
+    @abstractmethod
+    def indexes(self, schema: str | None, name: str) -> Found[IndexInfo] | None:
+        """Indexes of a table, found as describe() finds it; None if there's no such table."""
+
+    def schemas(self) -> list[SchemaInfo]:
+        """Every schema the user can see, system ones included and flagged."""
+        return [SchemaInfo(name, bool(current), bool(system)) for name, current, system in self._catalog(self._SCHEMAS, {})]
+
+    def describe_result(self, sql: str, params: Mapping[str, Any] | None = None) -> list[ResultColumn]:
+        """The columns a query returns.
+
+        This default runs the statement and reads cursor.description without
+        fetching, so it refuses anything but reads: DML would run, and DDL
+        would commit. Oracle and SQL Server override it to describe without
+        running.
+        """
+        if first_keyword(sql, self.dialect) not in _READS:
+            raise UsageError(f"--meta runs the statement on {self.config.driver}, so it only takes a query")
+        cursor = self._new_cursor(1)
+        self._run(cursor, sql, params)
+        return [
+            ResultColumn(position, d[0], self._type_name(d[1]), d[6], d[3], d[4], d[5])
+            for position, d in enumerate(cursor.description or (), 1)
+        ]
+
+    def _type_name(self, type_code: Any) -> str:
+        """Readable name for a cursor.description type code."""
+        return str(type_code)
 
 
     @classmethod
     def prepare(cls, sql: str) -> str:
         """Adjust a statement's text for this database; --native skips this."""
         return sql
+
+    @classmethod
+    def statements(cls, text: str) -> list[tuple[int, str]]:
+        """(line, SQL) for each statement, after prepare(); ones left empty are dropped.
+
+        Raises ValueError for text the splitter can't take (MySQL DELIMITER).
+        """
+        return [(line, sql) for line, piece in split_statements(text, cls.dialect)
+                if has_code(sql := cls.prepare(piece), cls.dialect)]
 
     @classmethod
     def placeholder(cls, name: str) -> tuple[str, str]:
@@ -122,9 +195,17 @@ class Connector(ABC):
         while batch := cursor.fetchmany():
             yield from batch
 
-    def _has_more_results(self, cursor: Any) -> bool:
-        """Whether another result set with columns follows the current one."""
-        return False
+    def _result_sets(self, cursor: Any) -> Iterator[Any]:
+        """Cursors for each result set with columns, the statement's own first.
+
+        Each is asked for only once the rows before it have been read or discarded.
+        """
+        if cursor.description is not None:
+            yield cursor
+
+    def _discard(self, cursor: Any) -> None:
+        """Drop unread rows so the connection can run the next statement."""
+        cursor.close()
 
     def connect(self) -> None:
         label = self.config.label
@@ -155,6 +236,10 @@ class Connector(ABC):
         so the row after it arrives in the same round trip as the rest.
         """
         cursor = self._new_cursor(fetch_size if max_rows is None else min(max_rows + 1, 10 * FETCH_SIZE))
+        self._run(cursor, sql, params)
+        return Result(self, cursor, sql)
+
+    def _run(self, cursor: Any, sql: str, params: Mapping[str, Any] | Sequence[Any] | None) -> None:
         try:
             if params is None:
                 cursor.execute(sql)
@@ -162,7 +247,6 @@ class Connector(ABC):
                 cursor.execute(sql, params)
         except self.driver.Error as e:
             raise QueryError(self._describe(e, sql)) from e
-        return Result(self, cursor, sql)
 
     def commit(self) -> None:
         try:
@@ -219,8 +303,32 @@ class Connector(ABC):
             raise ConfigError(f"connections.{self.config.label}.url: {e}") from None
 
 
+def group_indexes(
+    rows: Iterable[tuple[str, bool, bool, str | None, str | None, bool, bool]],
+) -> list[IndexInfo]:
+    """Build IndexInfo from one row per index column, in key order.
+
+    Each row is (index name, unique, primary, type, column text, descending,
+    included); a row with no index name (a table without indexes) is
+    skipped. The primary key comes first, then the rest by name.
+    """
+    grouped: dict[str, tuple[IndexInfo, list[str], list[str]]] = {}
+    for name, unique, primary, type_, column, descending, included in rows:
+        if name is None:
+            continue
+        if name not in grouped:
+            grouped[name] = (IndexInfo(name, "", bool(unique), bool(primary), type_, None), [], [])
+        if column is not None:
+            grouped[name][2 if included else 1].append(f"{column} DESC" if descending else column)
+    indexes = [
+        replace(info, columns=", ".join(keys), include=", ".join(included) or None)
+        for info, keys, included in grouped.values()
+    ]
+    return sorted(indexes, key=lambda i: (not i.primary, i.name))
+
+
 class Result:
-    """Output of one statement. columns is None when it returned no rows.
+    """Output of one statement: one or more result sets, or none (columns is None).
 
     affected is the number of changed rows, or None when rowcount doesn't
     mean that (e.g. DDL, which Oracle and MySQL report as 0). Values are the
@@ -230,16 +338,30 @@ class Result:
 
     def __init__(self, connector: Connector, cursor: Any, sql: str) -> None:
         self._connector = connector
-        self._cursor = cursor
         self._sql = sql
-        self._exhausted = False
-        description = cursor.description
-        self.columns: list[str] | None = [d[0] for d in description] if description else None
+        self._cursor = cursor
+        # Read first: moving on to further result sets changes it.
+        rowcount = cursor.rowcount
+        self._sets = connector._result_sets(cursor)
+        self.columns: list[str] | None = None
         self.affected: int | None = None
-        if self.columns is None:
-            rowcount = cursor.rowcount
-            if rowcount > 0 or (rowcount == 0 and first_keyword(sql, connector.config.driver) in _DML):
-                self.affected = rowcount
+        if not self.next_set() and (
+            rowcount > 0 or (rowcount == 0 and first_keyword(sql, connector.dialect) in _DML)
+        ):
+            self.affected = rowcount
+
+    def next_set(self) -> bool:
+        """Move to the next result set with columns, once this one is read or discarded."""
+        cursor = next(self._sets, None)
+        if cursor is None:
+            return False
+        self._cursor = cursor
+        self.columns = [d[0] for d in cursor.description]
+        return True
+
+    def discard(self) -> None:
+        """Drop this set's unread rows, e.g. after --max-rows, so the connection is free again."""
+        self._connector._discard(self._cursor)
 
     def rows(self) -> Iterator[tuple]:
         """Yield rows, fetching in batches.
@@ -252,8 +374,3 @@ class Result:
             yield from self._connector._iter_rows(self._cursor)
         except self._connector.driver.Error as e:
             raise QueryError(self._connector._describe(e, self._sql)) from e
-        self._exhausted = True
-
-    def has_more_results(self) -> bool:
-        """Whether more result sets with columns follow; False until every row is read."""
-        return self._exhausted and self._connector._has_more_results(self._cursor)

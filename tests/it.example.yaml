@@ -1,0 +1,29 @@
+# Connections for tests/test_integration.py against tests/compose.yaml.
+# Every it-* label runs each test; admin-oracle is only for the synonym test.
+connections:
+  it-oracle:
+    driver: oracle
+    url: 127.0.0.1:31521/FREEPDB1
+    user: prober
+    password: prober_pw
+  it-mssql:
+    driver: mssql
+    url: 127.0.0.1:31433/tempdb
+    user: sa
+    password: Probe-Pass-2026
+  it-mysql:
+    driver: mysql
+    url: 127.0.0.1:33307/probe
+    user: prober
+    password: prober-pw
+  it-mariadb:
+    driver: mysql
+    url: 127.0.0.1:33306/probe
+    user: prober
+    password: prober-pw
+    options: {collation: utf8mb4_general_ci}
+  admin-oracle:
+    driver: oracle
+    url: 127.0.0.1:31521/FREEPDB1
+    user: system
+    password: probe_sys_pw

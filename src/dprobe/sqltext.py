@@ -1,6 +1,7 @@
 """Lexing of SQL text into code, quoted and comment spans, and statement-ending cleanup."""
 
 import re
+from bisect import bisect_right
 from collections.abc import Iterator
 from typing import Literal
 
@@ -13,6 +14,15 @@ _PLSQL_START = re.compile(
     r"(PROCEDURE|FUNCTION|PACKAGE|TRIGGER|TYPE))\b",
     re.IGNORECASE,
 )
+# Where a quote or comment could start, so lex() can skip plain code quickly.
+_CANDIDATES = {
+    "oracle": re.compile(r"--|/\*|[qQ]'|['\"]"),
+    "mysql": re.compile(r"--|#|/\*|['\"`]"),
+    "mssql": re.compile(r"--|/\*|['\"\[]"),
+}
+_FIRST_CODE = re.compile(r"\S")
+# Enough leading code to read the first keywords, e.g. CREATE OR REPLACE PROCEDURE.
+_PREFIX = 200
 
 
 def lex(sql: str, dialect: str) -> Iterator[tuple[Kind, int, int]]:
@@ -24,8 +34,10 @@ def lex(sql: str, dialect: str) -> Iterator[tuple[Kind, int, int]]:
     [identifiers] and nested /* */ comments. An unterminated quote or comment
     runs to the end of the text.
     """
+    candidates = _CANDIDATES.get(dialect, _CANDIDATES["oracle"])
     code_start = i = 0
-    while i < len(sql):
+    while match := candidates.search(sql, i):
+        i = match.start()
         special = _special_at(sql, i, dialect)
         if special is None:
             i += 1
@@ -41,13 +53,65 @@ def lex(sql: str, dialect: str) -> Iterator[tuple[Kind, int, int]]:
 
 def is_plsql(sql: str) -> bool:
     """True for anonymous blocks and CREATE PROCEDURE/FUNCTION/PACKAGE/TRIGGER/TYPE."""
-    return _PLSQL_START.match(_without_comments(sql, "oracle")) is not None
+    return _PLSQL_START.match(_code_prefix(sql, "oracle")) is not None
 
 
 def first_keyword(sql: str, dialect: str) -> str:
     """The first word outside comments, upper-cased; "" if there is none."""
-    match = re.match(r"\s*([A-Za-z_]\w*)", _without_comments(sql, dialect))
+    match = re.match(r"\s*([A-Za-z_]\w*)", _code_prefix(sql, dialect))
     return match[1].upper() if match else ""
+
+
+_GO_LINE = re.compile(r"^[ \t]*GO[ \t]*$", re.IGNORECASE | re.MULTILINE)
+_SLASH_LINE = re.compile(r"^[ \t]*/[ \t]*$", re.MULTILINE)
+_DELIMITER_LINE = re.compile(r"^[ \t]*DELIMITER\b", re.IGNORECASE | re.MULTILINE)
+_SEMICOLON = re.compile(";")
+
+
+def split_statements(sql: str, dialect: str) -> list[tuple[int, str]]:
+    """Split a script into (line number of the first code, statement) pairs.
+
+    mssql splits on GO lines, into batches that may each hold several
+    statements. oracle and mysql split after a ";" outside strings and
+    comments; an Oracle PL/SQL block (BEGIN, DECLARE, CREATE PROCEDURE, ...)
+    runs to a "/" line instead, as in SQL*Plus. Each piece keeps its
+    terminator for prepare() to remove, and pieces with no code are dropped.
+    MySQL's DELIMITER is a mysql-client command and raises ValueError.
+    """
+    spans = list(lex(sql, dialect))
+    code = [(start, end) for kind, start, end in spans if kind == "code"]
+    code_starts = [start for start, _ in code]
+    # Same length as sql with comments blanked, for finding keywords and the first code.
+    blank = "".join(" " * (end - start) if kind == "comment" else sql[start:end] for kind, start, end in spans)
+
+    def in_code(pos: int) -> bool:
+        i = bisect_right(code_starts, pos) - 1
+        return i >= 0 and pos < code[i][1]
+
+    def ends(pattern: re.Pattern[str]) -> list[int]:
+        return [m.end() for m in pattern.finditer(sql) if in_code(m.start())]
+
+    def after(positions: list[int], pos: int) -> int:
+        i = bisect_right(positions, pos)
+        return positions[i] if i < len(positions) else len(sql)
+
+    if dialect == "mysql" and ends(_DELIMITER_LINE):
+        raise ValueError("DELIMITER is a mysql client command; dprobe runs each statement as written")
+    semicolons = [] if dialect == "mssql" else ends(_SEMICOLON)
+    lines = ends(_GO_LINE if dialect == "mssql" else _SLASH_LINE) if dialect in ("mssql", "oracle") else []
+    pieces, pos, line, counted = [], 0, 1, 0
+    while pos < len(sql):
+        if dialect == "mssql" or (dialect == "oracle" and _PLSQL_START.match(blank, pos)):
+            end = after(lines, pos)
+        else:
+            end = min(after(semicolons, pos), after(lines, pos))
+        # The line is where the SQL itself starts, after any leading comments.
+        if first := _FIRST_CODE.search(blank, pos, end):
+            line += sql.count("\n", counted, first.start())
+            counted = first.start()
+            pieces.append((line, sql[pos:end]))
+        pos = end
+    return pieces
 
 
 def split_name(text: str) -> list[tuple[str, bool]]:
@@ -96,8 +160,23 @@ def remove_trailing_line(sql: str, pattern: str, dialect: str) -> str:
     return sql[:start] + sql[end:]
 
 
-def _without_comments(sql: str, dialect: str) -> str:
-    return "".join(" " if kind == "comment" else sql[s:e] for kind, s, e in lex(sql, dialect))
+def has_code(sql: str, dialect: str) -> bool:
+    """True unless sql is only whitespace and comments."""
+    return any(kind != "comment" and not sql[s:e].isspace() for kind, s, e in lex(sql, dialect))
+
+
+def _code_prefix(sql: str, dialect: str) -> str:
+    """The start of sql with comments blanked, stopping after _PREFIX characters of code."""
+    parts, size = [], 0
+    for kind, start, end in lex(sql, dialect):
+        if kind == "comment":
+            parts.append(" ")
+            continue
+        parts.append(sql[start : min(end, start + _PREFIX - size)])
+        size += end - start
+        if size >= _PREFIX:
+            break
+    return "".join(parts)
 
 
 def _last_code_end(sql: str, dialect: str) -> int | None:
@@ -137,43 +216,47 @@ def _line_end(sql: str, i: int) -> int:
     return len(sql) if end == -1 else end
 
 
+_COMMENT_MARKS = re.compile(r"/\*|\*/")
+
+
 def _block_comment_end(sql: str, i: int, *, nested: bool) -> int:
-    depth, j = 0, i
-    while j < len(sql):
-        pair = sql[j : j + 2]
-        if pair == "/*" and (nested or depth == 0):
-            depth, j = depth + 1, j + 2
-        elif pair == "*/":
-            depth, j = depth - 1, j + 2
-            if depth == 0:
-                return j
-        else:
-            j += 1
+    if not nested:
+        end = sql.find("*/", i + 2)
+        return len(sql) if end == -1 else end + 2
+    depth = 0
+    for mark in _COMMENT_MARKS.finditer(sql, i):
+        depth += 1 if mark[0] == "/*" else -1
+        if depth == 0:
+            return mark.end()
     return len(sql)
 
 
 def _quote_end(sql: str, i: int, close: str, *, backslash: bool) -> int:
     # A doubled closing character ('' or ]] or ``) is an escaped one.
+    stop = re.compile(r"\\.|" + re.escape(close), re.DOTALL) if backslash else None
     j = i + 1
-    while j < len(sql):
-        ch = sql[j]
-        if backslash and ch == "\\":
-            j += 2
-        elif ch == close:
-            if sql[j + 1 : j + 2] != close:
-                return j + 1
-            j += 2
+    while True:
+        if stop:
+            match = stop.search(sql, j)
+            j = match.start() if match else -1
+            if match and match[0] != close:
+                j = match.end()
+                continue
         else:
-            j += 1
-    return len(sql)
+            j = sql.find(close, j)
+        if j == -1:
+            return len(sql)
+        if sql[j + 1 : j + 2] != close:
+            return j + 1
+        j += 2
 
 
 def _starts_q_quote(sql: str, i: int) -> bool:
     # q'...' or nq'...', but not an identifier ending in q (e.g. "seq'").
-    before = sql[:i]
-    if before[-1:] in ("n", "N"):
-        before = before[:-1]
-    return not (before[-1:].isalnum() or before[-1:] in ("_", "$", "#"))
+    j = i - 1
+    if j >= 0 and sql[j] in "nN":
+        j -= 1
+    return j < 0 or not (sql[j].isalnum() or sql[j] in "_$#")
 
 
 def _q_quote_end(sql: str, i: int) -> int:

@@ -1,9 +1,10 @@
 import re
-from contextlib import closing
 from types import ModuleType
 from typing import Any
 
-from dprobe.connectors.base import ColumnInfo, Connector, Described, Result, TableInfo
+from dprobe.connectors.base import (
+    ColumnInfo, Connector, Found, IndexInfo, Result, TableInfo, group_indexes,
+)
 from dprobe.errors import UsageError
 
 _UNKNOWN_COLLATION = 1273
@@ -18,6 +19,15 @@ FROM information_schema.tables
 WHERE table_schema = %(schema)s AND table_type IN ({types})
   AND (%(pattern)s IS NULL OR UPPER(table_name) LIKE UPPER(%(pattern)s))
 ORDER BY table_name
+"""
+# One row per index column; the LEFT JOIN keeps a row for a table without indexes.
+_INDEXES = """
+SELECT s.index_name, s.non_unique, s.index_type, s.column_name, s.collation, s.sub_part,
+       {expression}
+FROM information_schema.tables t
+LEFT JOIN information_schema.statistics s ON s.table_schema = %(schema)s AND s.table_name = %(name)s
+WHERE t.table_schema = %(schema)s AND t.table_name = %(name)s
+ORDER BY s.index_name, s.seq_in_index
 """
 # The constant schema and table in the statistics ON clause let MariaDB and MySQL
 # 5.7 read one table's statistics instead of the whole server's.
@@ -44,7 +54,18 @@ class MysqlConnector(Connector):
     commits implicitly and still runs.
     """
 
+    dialect = "mysql"
     ddl_autocommits = True
+    # A user only sees schemas it has privileges on; information_schema is always there.
+    _SCHEMAS = """
+SELECT schema_name, schema_name = DATABASE(),
+       schema_name IN ('information_schema', 'mysql', 'performance_schema', 'sys')
+FROM information_schema.schemata ORDER BY schema_name
+"""
+
+    def __init__(self, *args: Any) -> None:
+        super().__init__(*args)
+        self._killer: Any = None  # a second connection, opened on first need, for KILL QUERY
 
     def _import_driver(self) -> ModuleType:
         import mysql.connector
@@ -76,10 +97,9 @@ class MysqlConnector(Connector):
         params = {"schema": schema or self._database(), "pattern": like}
         return [TableInfo(*row) for row in self._catalog(_TABLES.format(types=types), params)]
 
-    def describe(self, schema: str | None, name: str) -> Described | None:
+    def describe(self, schema: str | None, name: str) -> Found[ColumnInfo] | None:
         """Names match exactly: on Linux, MySQL table names are case-sensitive."""
         schema = schema or self._database()
-        mariadb = "MariaDB" in self.conn.server_info
         columns = []
         for position, column, type_, nullable, default, pk, extra, comment in self._catalog(
                 _COLUMNS, {"schema": schema, "name": name}):
@@ -88,24 +108,45 @@ class MysqlConnector(Connector):
                 name=column,
                 type=type_,
                 nullable=nullable == "YES",
-                default=mysql_default(default, type_, extra, mariadb=mariadb),
+                default=mysql_default(default, type_, extra, mariadb=self._mariadb),
                 pk=int(pk) if pk is not None else None,
                 # DEFAULT_GENERATED only flags an expression default.
                 extra=extra.replace("DEFAULT_GENERATED", "").strip() or None,
                 comment=comment or None,
             ))
-        return Described(schema, name, columns) if columns else None
+        return Found(schema, name, columns) if columns else None
 
-    def raw_columns(self, table: Described) -> Result:
+    def indexes(self, schema: str | None, name: str) -> Found[IndexInfo] | None:
+        schema = schema or self._database()
+        # MariaDB has no statistics.expression (MySQL 8.0.13+ functional key parts).
+        expression = "NULL" if self._mariadb else "s.expression"
+        rows = self._catalog(_INDEXES.format(expression=expression), {"schema": schema, "name": name})
+        if not rows:
+            return None
+        indexes = group_indexes(
+            (index, not non_unique, index == "PRIMARY", index_type,
+             _index_column(column, sub_part, expr), collation == "D", False)
+            for index, non_unique, index_type, column, collation, sub_part, expr in rows
+        )
+        return Found(schema, name, indexes)
+
+    def _type_name(self, type_code: Any) -> str:
+        return self.driver.FieldType.get_info(type_code)
+
+    def raw_columns(self, table: Found) -> Result:
         sql = ("SELECT * FROM information_schema.columns "
                "WHERE table_schema = %(schema)s AND table_name = %(name)s ORDER BY ordinal_position")
         return self.execute(sql, {"schema": table.schema, "name": table.name})
 
     def _database(self) -> str:
         # dprobe never runs USE, so the database is the one it connected with.
-        if database := self._connect_args().get("database"):
+        if database := self._host_url()[2] or self.config.options.get("database"):
             return database
         raise UsageError(f"{self.config.label} has no database in its url, so give a schema")
+
+    @property
+    def _mariadb(self) -> bool:
+        return "MariaDB" in self.conn.server_info
 
     def _start_readonly(self) -> None:
         self.conn.start_transaction(readonly=True)
@@ -123,7 +164,14 @@ class MysqlConnector(Connector):
 
     def close(self) -> None:
         self._kill_unread()
+        if self._killer is not None:
+            killer, self._killer = self._killer, None
+            killer.close()
         super().close()
+
+    def _discard(self, cursor: Any) -> None:
+        self._kill_unread()
+        super()._discard(cursor)
 
     def _kill_unread(self) -> None:
         """End a statement whose rows weren't all read (output stopped at max_rows).
@@ -136,9 +184,11 @@ class MysqlConnector(Connector):
         if self.conn is None or not self.conn.unread_result:
             return
         try:
-            with closing(self.driver.connect(**self._connect_args())) as killer:
-                with killer.cursor() as cursor:
-                    cursor.execute(f"KILL QUERY {self.conn.connection_id}")
+            # Kept open for the next cut-short result, e.g. in a --script.
+            if self._killer is None:
+                self._killer = self.driver.connect(**self._connect_args())
+            with self._killer.cursor() as cursor:
+                cursor.execute(f"KILL QUERY {self.conn.connection_id}")
             self.conn.consume_results()
         except self.driver.Error:
             pass  # close() still works, just slowly.
@@ -160,3 +210,10 @@ def mysql_default(default: str | None, column_type: str, extra: str, *, mariadb:
     if default.upper().startswith("CURRENT_TIMESTAMP"):
         return default
     return "'" + default.replace("'", "''") + "'"
+
+
+def _index_column(column: str | None, sub_part: int | None, expression: str | None) -> str | None:
+    """Key part as written in DDL: name(10) for a prefix, (expr) for a functional part."""
+    if column is None and expression is None:
+        return None
+    return f"({expression})" if expression else f"{column}({sub_part})" if sub_part else column

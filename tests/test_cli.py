@@ -8,7 +8,7 @@ import pytest
 
 from dprobe.cli import main
 from dprobe.connectors import REGISTRY
-from dprobe.connectors.base import ColumnInfo, Connector, Described, TableInfo
+from dprobe.connectors.base import ColumnInfo, Connector, Found, SchemaInfo, TableInfo, group_indexes
 
 CONFIG = """
     connections:
@@ -30,6 +30,7 @@ class SqliteConnector(Connector):
     """Real DB-API behavior without a server; the database file is set per test."""
 
     database = ":memory:"
+    dialect = "mysql"
 
     def _import_driver(self):
         return sqlite3
@@ -60,10 +61,20 @@ class SqliteConnector(Connector):
                "FROM pragma_table_info(:name)")
         columns = [ColumnInfo(p, n, t, bool(nl), d, pk, e, c)
                    for p, n, t, nl, d, pk, e, c in self._catalog(sql, {"name": name})]
-        return Described("main", name, columns) if columns else None
+        return Found("main", name, columns) if columns else None
 
     def raw_columns(self, table):
         return self.execute("SELECT * FROM pragma_table_info(:name)", {"name": table.name})
+
+    def indexes(self, schema, name):
+        if not self._catalog("SELECT 1 FROM sqlite_master WHERE name = :name", {"name": name}):
+            return None
+        sql = ("SELECT l.name, l.\"unique\", l.origin = 'pk', NULL, i.name, 0, 0 FROM pragma_index_list(:name) l "
+               "JOIN pragma_index_info(l.name) i ORDER BY l.name, i.seqno")
+        return Found("main", name, group_indexes(self._catalog(sql, {"name": name})))
+
+    def schemas(self):
+        return [SchemaInfo("main", True, False), SchemaInfo("temp", False, True)]
 
 
 class FailingConnector(SqliteConnector):
@@ -81,6 +92,7 @@ def db(monkeypatch, tmp_path, write_config):
     with sqlite3.connect(path) as conn:
         conn.execute("CREATE TABLE people (id INTEGER PRIMARY KEY, name TEXT NOT NULL DEFAULT 'x', score REAL)")
         conn.execute("CREATE VIEW people_v AS SELECT id FROM people")
+        conn.execute("CREATE UNIQUE INDEX people_name ON people (name, score)")
         conn.executemany("INSERT INTO people VALUES (?, ?, ?)",
                          [(1, "Ann", 9.5), (2, "Bo", None), (3, "Cy", 7.0)])
     monkeypatch.setattr(SqliteConnector, "database", str(path))
@@ -331,3 +343,149 @@ def test_describe_not_found_suggests(db, capsys):
 def test_describe_bad_names(db, capsys, name, message):
     assert main(["describe", "web", name]) == 2
     assert re.search(message, capsys.readouterr().err)
+
+
+def test_indexes(db, capsys):
+    assert main(["indexes", "web", "people", "-f", "json"]) == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == [
+        {"name": "people_name", "columns": "name, score", "unique": True, "primary": False,
+         "type": None, "include": None},
+    ]
+    assert captured.err.startswith("(main.people: 1 index, ")
+    assert main(["indexes", "web", "nothing"]) == 1
+    assert "no table or view nothing" in capsys.readouterr().err
+
+
+def test_schemas_hide_system_ones(db, capsys):
+    assert main(["schemas", "web", "-f", "csv"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "name,current,system\nmain,true,false\n"
+    assert captured.err.startswith("(1 schema, ") and "; 1 system schema hidden, --all shows them)" in captured.err
+    assert main(["schemas", "web", "--all", "-f", "csv"]) == 0
+    assert capsys.readouterr().out.splitlines()[-1] == "temp,false,true"
+
+
+def test_query_meta(db, capsys):
+    assert main(["query", "web", "--meta", "-f", "csv", "-e", "SELECT id, name AS n FROM people"]) == 0
+    captured = capsys.readouterr()
+    assert [line.split(",")[:2] for line in captured.out.splitlines()] == [
+        ["position", "name"], ["1", "id"], ["2", "n"]]
+    assert captured.err.startswith("(2 result columns, ")
+    # The base implementation runs the statement, so it refuses anything but a query.
+    assert main(["query", "web", "--meta", "-e", "DELETE FROM people"]) == 2
+    assert "only takes a query" in capsys.readouterr().err
+
+
+def test_query_declared_binds_and_prompt(db, capsys, tmp_path, request):
+    (tmp_path / "q.sql").write_text("-- @bind id int = 2\n-- @bind extra\nSELECT name FROM people WHERE id = :id")
+    assert main(["query", "web", "q.sql", "-f", "csv"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "name\nBo\n"
+    assert "warning: the statement has no :extra" in captured.err
+    assert main(["query", "web", "q.sql", "-f", "csv", "-b", "id=3"]) == 0
+    assert capsys.readouterr().out == "name\nCy\n"
+
+    request.getfixturevalue("terminal").answers.append("1")
+    assert main(["query", "web", "-f", "csv", "-e", "SELECT name FROM people WHERE id = :who"]) == 0
+    assert capsys.readouterr().out == "name\nAnn\n"
+
+
+class MultiSetConnector(SqliteConnector):
+    """Every query also returns a second result set, like a SQL Server batch or Oracle implicit results."""
+
+    def _result_sets(self, cursor):
+        yield from super()._result_sets(cursor)
+        extra = self.conn.cursor()
+        extra.execute("SELECT 'second' AS s")
+        yield extra
+
+
+def test_query_several_statements_need_script(db, capsys):
+    assert main(["query", "web", "-e", "SELECT 1; SELECT 2"]) == 2
+    assert "the SQL holds 2 statements (lines 1, 1); add --script" in capsys.readouterr().err
+    assert main(["query", "web", "--script", "--native", "-e", "SELECT 1"]) == 2
+
+
+def test_script_runs_in_order_and_rolls_back(db, capsys):
+    script = "UPDATE people SET name = 'Z' WHERE id = 1;\nSELECT name FROM people ORDER BY id;\nSELECT 1 AS one;"
+    assert main(["query", "web", "--script", "-f", "csv", "-e", script]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "name\nZ\nBo\nCy\n\none\n1\n"
+    err = captured.err.splitlines()
+    assert err[:3] == ["(statement 1, line 1: 1 row affected)", "(statement 2, line 2: 3 rows)",
+                       "(statement 3, line 3: 1 row)"]
+    assert err[3].startswith("(3 statements; rolled back (use --commit to keep changes), ")
+    assert names(db) == ["Ann", "Bo", "Cy"]
+    assert main(["query", "web", "--script", "--commit", "-e", script]) == 0
+    assert capsys.readouterr().err.splitlines()[-1].startswith("(3 statements; committed, ")
+    assert names(db) == ["Z", "Bo", "Cy"]
+
+
+def test_script_stops_at_first_error_and_commits_nothing(db, capsys):
+    script = "UPDATE people SET name = 'Z';\nSELECT * FROM nope;\nUPDATE people SET name = 'Y';"
+    assert main(["query", "web", "--script", "--commit", "-e", script]) == 1
+    assert "dprobe: error: statement 2, line 2: no such table: nope" in capsys.readouterr().err
+    assert names(db) == ["Ann", "Bo", "Cy"]
+
+
+def test_script_json_and_truncation(db, capsys):
+    script = "SELECT id FROM people ORDER BY id; SELECT name FROM people WHERE id = 3"
+    assert main(["query", "web", "--script", "-f", "json", "--max-rows", "1", "-e", script]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == '[\n{"id": 1}\n]\n[\n{"name": "Cy"}\n]\n'
+    assert "(statement 1, line 1: first 1 row)" in captured.err
+    assert captured.err.splitlines()[-1].endswith("; --max-rows 0 shows all)")
+
+
+def test_script_binds_resolved_once(db, capsys, terminal):
+    terminal.answers.append("2")
+    script = "-- @bind id int\nSELECT name FROM people WHERE id = :id;\nSELECT id FROM people WHERE id = :id;"
+    assert main(["query", "web", "--script", "-f", "csv", "-e", script]) == 0
+    assert capsys.readouterr().out == "name\nBo\n\nid\n2\n"
+    assert terminal.asked == [":id (int): "]
+
+
+def test_dry_run_script(write_config, capsys):
+    write_config(CONFIG)
+    assert main(["query", "web", "--script", "--dry-run", "-b", "id:int=7",
+                 "-e", "SELECT :id; -- next\nDELETE FROM t WHERE id IN (:id)"]) == 0
+    assert capsys.readouterr().out == (
+        # MySQL keeps a trailing ";", which it accepts.
+        "-- statement 1, line 1\nSELECT %(id)s;\n-- bind id = 7 (int)\n\n"
+        "-- statement 2, line 2\n-- next\nDELETE FROM t WHERE id IN (%(id)s)\n-- bind id = 7 (int)\n"
+    )
+
+
+def test_query_prints_every_result_set(db, capsys, monkeypatch):
+    for driver in REGISTRY:
+        monkeypatch.setitem(REGISTRY, driver, MultiSetConnector)
+    assert main(["query", "web", "-f", "csv", "-e", "SELECT id FROM people WHERE id = 1"]) == 0
+    captured = capsys.readouterr()
+    assert captured.out == "id\n1\n\ns\nsecond\n"
+    err = captured.err.splitlines()
+    assert err[:2] == ["(result 1: 1 row)", "(result 2: 1 row)"]
+    assert err[2].startswith("(2 results, ")
+
+
+def test_query_list_bind(db, capsys):
+    assert main(["query", "web", "-f", "csv", "-b", "ids:int[]=1,3",
+                 "-e", "SELECT name FROM people WHERE id IN (:ids) ORDER BY id"]) == 0
+    assert capsys.readouterr().out == "name\nAnn\nCy\n"
+
+
+def test_keyring_command(write_config, capsys, monkeypatch, memory_keyring):
+    memory = memory_keyring
+    write_config("connections:\n  kr:\n    driver: mysql\n    url: h/d\n    user: u\n    keyring: dprobe\n")
+    assert main(["keyring", "kr"]) == 2
+    assert "no terminal to prompt on" in capsys.readouterr().err
+
+    from dprobe import config, tty
+
+    monkeypatch.setattr(tty, "available", lambda: True)
+    monkeypatch.setattr(config.getpass, "getpass", lambda prompt: "typed-secret")
+    assert main(["keyring", "kr"]) == 0
+    assert "stored the password for u in keyring service dprobe" in capsys.readouterr().out
+    assert memory.get_password("dprobe", "u") == "typed-secret"
+    assert main(["keyring", "kr", "--delete"]) == 0
+    assert memory.get_password("dprobe", "u") is None

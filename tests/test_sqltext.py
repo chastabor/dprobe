@@ -112,3 +112,36 @@ def test_split_name(text, parts):
     from dprobe.sqltext import split_name
 
     assert split_name(text) == parts
+
+
+@pytest.mark.parametrize(
+    ("dialect", "sql", "expected"),
+    [
+        ("oracle", "SELECT 1 FROM dual;\n-- c;\nSELECT ';' FROM dual;\nBEGIN\n  NULL;\nEND;\n/\n"
+                   "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/\nSELECT 2 FROM dual\n/\n",
+         [(1, "SELECT 1 FROM dual;"), (3, "-- c;\nSELECT ';' FROM dual;"), (4, "BEGIN\n  NULL;\nEND;\n/"),
+          (8, "CREATE OR REPLACE PROCEDURE p AS\nBEGIN\n  NULL;\nEND;\n/"), (13, "SELECT 2 FROM dual\n/")]),
+        ("mysql", "SELECT 1; SELECT 'a;b' # x;\n; SELECT 3",
+         [(1, "SELECT 1;"), (1, "SELECT 'a;b' # x;\n;"), (2, "SELECT 3")]),
+        ("mssql", "DECLARE @x int = 5; SELECT @x\nGO\n/* GO\n*/ SELECT 2\ngo\n",
+         [(1, "DECLARE @x int = 5; SELECT @x\nGO"), (4, "/* GO\n*/ SELECT 2\ngo")]),
+        ("oracle", "-- only a comment\n", []),
+    ],
+)
+def test_split_statements(dialect, sql, expected):
+    from dprobe.sqltext import split_statements
+
+    assert [(line, piece.strip()) for line, piece in split_statements(sql, dialect)] == expected
+
+
+def test_split_statements_rejects_delimiter():
+    from dprobe.sqltext import split_statements
+
+    with pytest.raises(ValueError, match="DELIMITER is a mysql client command"):
+        split_statements("DELIMITER //\nCREATE PROCEDURE p() BEGIN SELECT 1; END //", "mysql")
+
+
+def test_split_statements_piece_with_only_a_quoted_name():
+    from dprobe.sqltext import split_statements
+
+    assert split_statements("SELECT 1\nGO\n[GO]\n", "mssql") == [(1, "SELECT 1\nGO"), (3, "\n[GO]\n")]

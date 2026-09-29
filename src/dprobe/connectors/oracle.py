@@ -1,8 +1,13 @@
+import re
+from collections.abc import Callable, Iterator, Mapping
 from dataclasses import replace
 from types import ModuleType
 from typing import Any
 
-from dprobe.connectors.base import ColumnInfo, Connector, Described, Result, TableInfo
+from dprobe.connectors.base import (
+    ColumnInfo, Connector, Found, IndexInfo, Result, ResultColumn, TableInfo, group_indexes,
+)
+from dprobe.errors import QueryError
 from dprobe.sqltext import is_plsql, remove_trailing_line, remove_trailing_semicolon
 
 # The current schema unless a schema was given, resolved in the query to save a round trip.
@@ -32,6 +37,24 @@ LEFT JOIN (
 WHERE c.owner = {_OWNER} AND c.table_name = :name AND c.hidden_column = 'NO'
 ORDER BY c.column_id
 """
+# One row per index column; the LEFT JOINs keep a row for a table without indexes.
+# LOB indexes are the hidden ones Oracle makes for LOB columns.
+_INDEXES = f"""
+SELECT t.owner, i.index_name, i.uniqueness, i.index_type, k.constraint_type,
+       c.column_name, c.descend, e.column_expression
+FROM all_objects t
+LEFT JOIN all_indexes i
+  ON i.table_owner = t.owner AND i.table_name = t.object_name AND i.index_type <> 'LOB'
+LEFT JOIN all_ind_columns c ON c.index_owner = i.owner AND c.index_name = i.index_name
+LEFT JOIN all_ind_expressions e
+  ON e.index_owner = c.index_owner AND e.index_name = c.index_name
+ AND e.column_position = c.column_position
+LEFT JOIN all_constraints k
+  ON k.owner = i.table_owner AND k.table_name = i.table_name
+ AND k.index_name = i.index_name AND k.constraint_type = 'P'
+WHERE t.owner = {_OWNER} AND t.object_name = :name AND t.object_type IN ('TABLE', 'VIEW')
+ORDER BY i.index_name, c.column_position
+"""
 # A private synonym in the current schema wins over a public one, as in Oracle.
 _SYNONYM = """
 SELECT table_owner, table_name FROM all_synonyms
@@ -52,7 +75,14 @@ class OracleConnector(Connector):
     commits implicitly and still runs.
     """
 
+    dialect = "oracle"
     ddl_autocommits = True
+    # all_users lists every user, including those that own nothing.
+    _SCHEMAS = """
+SELECT username, CASE WHEN username = SYS_CONTEXT('USERENV', 'CURRENT_SCHEMA') THEN 1 ELSE 0 END,
+       CASE oracle_maintained WHEN 'Y' THEN 1 ELSE 0 END
+FROM all_users ORDER BY username
+"""
 
     def _import_driver(self) -> ModuleType:
         import oracledb
@@ -85,20 +115,52 @@ class OracleConnector(Connector):
         sql = _TABLES.format(types="'TABLE', 'VIEW'" if views else "'TABLE'")
         return [TableInfo(*row) for row in self._catalog(sql, {"owner": schema, "pattern": like})]
 
-    def describe(self, schema: str | None, name: str) -> Described | None:
+    def describe(self, schema: str | None, name: str) -> Found[ColumnInfo] | None:
         """Without a schema, looks in the current schema, then private and public synonyms."""
-        if found := self._columns(schema, name):
+        return self._find(schema, name, self._columns)
+
+    def indexes(self, schema: str | None, name: str) -> Found[IndexInfo] | None:
+        return self._find(schema, name, self._indexes)
+
+    def describe_result(self, sql: str, params: Mapping[str, Any] | None = None) -> list[ResultColumn]:
+        """Parses without running, so any statement is safe; only queries have columns."""
+        cursor = self._new_cursor(1)
+        try:
+            cursor.parse(sql)
+        except self.driver.Error as e:
+            raise QueryError(self._describe(e, sql)) from e
+        # A NUMBER without precision is described as precision 0, scale -127.
+        return [
+            ResultColumn(position, d.name, d.type_code.name.removeprefix("DB_TYPE_"), d.null_ok,
+                         d.internal_size, d.precision or None, None if d.scale == -127 else d.scale)
+            for position, d in enumerate(cursor.description or (), 1)
+        ]
+
+    def _find[T](self, schema: str | None, name: str,
+                 lookup: Callable[[str | None, str], Found[T] | None]) -> Found[T] | None:
+        if found := lookup(schema, name):
             return found
         if schema is None and (targets := self._catalog(_SYNONYM, {"name": name})):
-            found = self._columns(*targets[0])
+            found = lookup(*targets[0])
             return replace(found, synonym=name) if found else None
         return None
 
-    def raw_columns(self, table: Described) -> Result:
+    def _indexes(self, owner: str | None, name: str) -> Found[IndexInfo] | None:
+        rows = self._catalog(_INDEXES, {"owner": owner, "name": name})
+        if not rows:
+            return None
+        indexes = group_indexes(
+            (index, uniqueness == "UNIQUE", constraint == "P", index_type,
+             _index_column(column, expression), descend == "DESC", False)
+            for _, index, uniqueness, index_type, constraint, column, descend, expression in rows
+        )
+        return Found(rows[0][0], name, indexes)
+
+    def raw_columns(self, table: Found) -> Result:
         sql = "SELECT * FROM all_tab_columns WHERE owner = :owner AND table_name = :name ORDER BY column_id"
         return self.execute(sql, {"owner": table.schema, "name": table.name})
 
-    def _columns(self, owner: str | None, name: str) -> Described | None:
+    def _columns(self, owner: str | None, name: str) -> Found[ColumnInfo] | None:
         rows = self._catalog(_COLUMNS, {"owner": owner, "name": name})
         if not rows:
             return None
@@ -118,7 +180,7 @@ class OracleConnector(Connector):
                  nullable, default, identity, virtual, pk, comment) in rows
         ]
         # The owner as resolved, i.e. the current schema when none was given.
-        return Described(rows[0][0], name, columns)
+        return Found(rows[0][0], name, columns)
 
     @classmethod
     def prepare(cls, sql: str) -> str:
@@ -133,6 +195,19 @@ class OracleConnector(Connector):
     def _start_readonly(self) -> None:
         with self.conn.cursor() as cursor:
             cursor.execute("SET TRANSACTION READ ONLY")
+
+    def _result_sets(self, cursor: Any) -> Iterator[Any]:
+        """A query's own rows, or those a PL/SQL block returned with DBMS_SQL.RETURN_RESULT (12c+)."""
+        if cursor.description is not None:
+            yield cursor
+            return
+        try:
+            results = cursor.getimplicitresults()
+        except self.driver.Error:
+            return  # Not PL/SQL, so there are none.
+        for result in results:
+            result.arraysize = cursor.arraysize
+            yield result
 
     def _new_cursor(self, arraysize: int) -> Any:
         cursor = super()._new_cursor(arraysize)
@@ -162,3 +237,11 @@ def oracle_type(data_type: str, length: Any, char_length: Any, char_used: str | 
     if data_type in ("RAW", "UROWID"):
         return f"{data_type}({length})"
     return data_type
+
+
+def _index_column(column: str | None, expression: str | None) -> str | None:
+    """A function-based index shows its expression; a DESC column is stored as one ("NAME")."""
+    if column is None:
+        return None
+    text = expression.strip() if expression else column
+    return text[1:-1] if re.fullmatch(r'"[^"]+"', text) else text

@@ -39,6 +39,8 @@ connections:
 
 [`dprobe.example.yaml`](dprobe.example.yaml) has SQL Server and MySQL entries too, with `password_cmd`, driver `options` and the keyring. For those two, `url` is `host[:port][/database]`; a SQL Server named instance goes in the host, `sqlsrv01\SQLEXPRESS/sis`.
 
+**YAML 1.2 values.** The config and bind files follow the YAML 1.2 core schema, a superset of JSON, rather than PyYAML's YAML 1.1: only `true`/`false` are booleans, so `off`, `yes` and `no` are text (`encryption: off` just works); dates and times stay text; `01234` is 1234, not octal. Merge keys (`<<: *anchor`) still work.
+
 **Override file.** As with Docker Compose, a file with the same name plus `.override` is merged over the config when it exists beside it: `dprobe.yaml` gets `dprobe.override.yaml`, and `tests/it.example.yaml` gets `tests/it.example.override.yaml`. It's the usual place for passwords, and `.gitignore` already skips `*.override.yaml`.
 
 ```yaml
@@ -111,7 +113,7 @@ dprobe query hr-prod report.sql --binds values.yaml
 ```
 
 - **Types:** values are text unless typed: `str`, `int`, `float`, `decimal`, `date`, `datetime`, `bool`, `null`, or `TYPE[]` for a comma-separated list.
-- **A binds file** is a YAML or JSON (`.json`) mapping. A key can carry a type (`"amount:decimal": "12.50"`). Quote strings like `01234` or `NO`, which YAML would read as numbers or booleans. `-b` wins over the file.
+- **A binds file** is a YAML or JSON (`.json`) mapping. A key can carry a type (`"amount:decimal": "12.50"`, `"hired:date": 2024-01-02`). Dates stay text unless typed, and a number with leading zeros like `01234` needs quotes to keep them. `-b` wins over the file.
 - **Declarations** in the SQL file give a type and a default:
 
   ```sql

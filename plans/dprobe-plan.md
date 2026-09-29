@@ -27,6 +27,7 @@ src/dprobe/
   errors.py            # exceptions carrying exit codes, secret masking
   sqltext.py           # lexer (code / quoted / comment spans), statement-ending cleanup
   tty.py               # questions on /dev/tty (password and bind prompts)
+  yaml12.py            # PyYAML loader with YAML 1.2 core-schema values
   binds.py             # find :name placeholders (via sqltext), rewrite per driver, parse values
   output.py            # table / csv / tsv / json / jsonl
   connectors/
@@ -80,6 +81,11 @@ connections:
 - **Override file:** as with Docker Compose, `<name>.override<suffix>` beside the config file (`dprobe.yaml` → `dprobe.override.yaml`) is merged over it when present. It's for passwords and other local changes, and `.gitignore` skips `*.override.yaml` / `*.override.yml`.
   - **Merging:** mappings merge key by key; other values replace; `null` removes a key. So `password_cmd: null` plus `password: …` swaps one for the other, and `<label>: null` drops a connection.
   - **Validation** runs on the merged data, with errors prefixed `dprobe.yaml with dprobe.override.yaml:`. `-v` shows both files.
+- **YAML 1.2 values** (`dprobe/yaml12.py`): PyYAML only knows YAML 1.1, so dprobe swaps its value rules for the YAML 1.2 core schema (a superset of JSON) in both config and bind files.
+  - Only `true`/`false` are booleans; `on`/`off`/`yes`/`no`/`y`/`n` are text.
+  - Integers are decimal (`01234` is 1234, not octal 668), with `0o` and `0x` prefixes for other bases; `1_000` and `1:30` are text.
+  - Dates and times stay text, as in JSON.
+  - Merge keys (`<<: *anchor`) still work, as they do in ruamel.yaml's 1.2 mode.
 - **`options`** is passed to the driver's `connect()`. It can fill in an argument dprobe leaves unset (e.g. `port`), but setting `host`, `user`, `password` and the like there is an error.
 - **Validation:** each entry is loaded into a frozen `ConnectionConfig` dataclass. Errors name the file and field, e.g. `connections.sis.url: invalid port '99999'`.
   - Unknown keys are rejected, which catches typos like `pasword`.
@@ -322,7 +328,7 @@ For testing a single hand-written query exactly as it will run elsewhere. dprobe
 Default mode only. Highest priority first:
 1. **`-b name[:type]=value`** on the command line (can be repeated). Only the first `=` splits, so `-b s=a=b` binds `"a=b"`.
 2. **`--binds file.yaml|json`**, a mapping of names to values. The file is read as JSON when it ends in `.json`, otherwise as YAML.
-   - YAML already gives you ints, floats, booleans, dates (`2024-01-01` → `date`), datetimes and `null`.
+   - YAML gives you ints, floats, booleans (`true`/`false` only) and `null`. Dates stay text under YAML 1.2, so type them: `"hired:date": 2024-01-02`.
    - A key can carry a type, e.g. `"amount:decimal": "12.50"`, and the value is then converted from its text.
    - Lists and mappings are rejected (list expansion is in 6.5).
 3. **`-- @bind NAME [TYPE] [= DEFAULT]` comments** in the SQL file. They're usually at the top, but any `--` comment counts:
@@ -348,7 +354,7 @@ Default mode only. Highest priority first:
   - `bool` takes `true`/`false`/`1`/`0` in any case; `yes`/`no` are rejected as ambiguous.
   - `null` takes no text: `-b x:null=`.
   - A bad value names the argument, e.g. `-b id:int=abc: 'abc' is not a valid int`.
-- **Command-line values aren't parsed as YAML.** PyYAML turns `01234` into 668 (octal) and `NO` into `False`. In a `--binds` YAML file the same applies, so quote such strings or add a `:str` type to the key.
+- **Command-line values aren't parsed as YAML;** they stay text unless typed. In a `--binds` YAML file, quote a number whose leading zeros matter (`"01234"`), or add a `:str` type to the key.
 - **Why offer types:** letting the database convert strings mostly works, but it can prevent index use (e.g. Oracle converting a string to a number), which slows queries.
 
 ### 6.5 Lists (step 6)
@@ -525,3 +531,4 @@ Made while building steps 1 and 2:
 23. **Plaintext passwords are allowed without a warning,** which settles the open decision. The `Config.warnings` mechanism, used only for that, is gone. `${VAR}` in `password` has a CLI test that follows it all the way to the connect call. (Section 2, Decisions)
 24. **Override files:** `<name>.override.yaml` beside the config is merged over it, as with Docker Compose, so passwords can live outside the shared file. (Section 2)
 25. **`test.sh`** runs the unit tests, or with `-i` starts the compose databases and runs everything; `--down` stops them afterwards. (Section 8)
+26. **YAML 1.2 values:** config and bind files use a PyYAML loader with the YAML 1.2 core schema. `on`/`off`/`yes`/`no` and dates stay text, and `01234` is decimal. No new dependency. (Sections 2, 6.3, 6.4)

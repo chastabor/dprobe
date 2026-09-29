@@ -65,6 +65,8 @@ def test_unknown_label(write_config):
         ("driver: mssql\n    url: h:99999/d", r"url: invalid port '99999'"),
         ("driver: mysql\n    url: h/d\n    password: a\n    password_cmd: b", "set only one of password"),
         ("driver: mysql\n    url: h/d\n    readonly: maybe", r"readonly: must be true or false"),
+        # YAML 1.2 reads yes as a string.
+        ("driver: mysql\n    url: h/d\n    readonly: yes", r"readonly: must be true or false"),
         ("driver: mysql\n    url: h/d\n    options: [1]", r"options: expected a mapping"),
     ],
 )
@@ -269,3 +271,14 @@ def test_merge():
         "a": {"b": 1, "c": 3, "e": 4}, "d": [2]}
     assert merge({"a": 1, "b": 2}, {"a": None}) == {"b": 2}
     assert merge({"a": {"b": 1}}, {"a": "x"}) == {"a": "x"}
+
+
+def test_yaml_12_values(write_config):
+    path = write_config("""
+        connections:
+          sis:
+            driver: mssql
+            url: h/d
+            options: {encryption: off, tds_version: 7.4}
+    """)
+    assert load_config(path).get("sis").options == {"encryption": "off", "tds_version": 7.4}

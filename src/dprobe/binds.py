@@ -10,8 +10,7 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
-import yaml
-
+from dprobe import yaml12
 from dprobe.config import read_utf8
 from dprobe.errors import UsageError
 from dprobe.sqltext import first_keyword, lex
@@ -170,16 +169,16 @@ def parse_bind_arg(text: str, declared: Mapping[str, Declared] | None = None) ->
 def load_binds_file(path: Path, declared: Mapping[str, Declared] | None = None) -> dict[str, Any]:
     """Read a YAML or JSON (by .json suffix) mapping of NAME[:TYPE] to value.
 
-    YAML 1.1 reads unquoted 01234 as octal 668 and yes/no as booleans, so
-    quote such strings. With a :TYPE suffix the value is converted from its
-    text, e.g. "amount:decimal": "12.50" keeps both digits; a declared type
-    converts string values only.
+    YAML follows the 1.2 core schema (see yaml12), so dates stay text: give
+    them a type, e.g. "hired:date": 2024-01-02. With a :TYPE suffix the value
+    is converted from its text, e.g. "amount:decimal": "12.50" keeps both
+    digits; a declared type converts string values only.
     """
     text = read_utf8(path, UsageError)
     is_json = path.suffix.lower() == ".json"
     try:
-        data = json.loads(text) if is_json else yaml.safe_load(text)
-    except (json.JSONDecodeError, yaml.YAMLError) as e:
+        data = json.loads(text) if is_json else yaml12.load(text)
+    except (json.JSONDecodeError, yaml12.YAMLError) as e:
         raise UsageError(f"{path}: invalid {'JSON' if is_json else 'YAML'}: {e}") from e
     if data is None:
         return {}

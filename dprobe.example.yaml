@@ -2,6 +2,8 @@
 # A plaintext password is allowed; ${VAR} reads one from the environment instead.
 # dprobe.override.yaml beside it, if present, is merged over this file: a good
 # place for passwords (e.g. connections: {hr-prod: {password: ...}}).
+# Values follow YAML 1.2: only true/false are booleans (on/off/yes/no are text),
+# dates stay text, and 01234 is 1234.
 
 defaults:
   format: table        # table, csv, tsv, json, jsonl
@@ -25,7 +27,7 @@ connections:
     # Runs through the shell; the first line of stdout is the password.
     password_cmd: secret-tool lookup db sis
     options:                       # passed straight to pymssql.connect()
-      encryption: require
+      encryption: require          # or off, or request
       tds_version: "7.4"           # quote it, or YAML reads a number
       login_timeout: 15
 

@@ -95,9 +95,11 @@ def test_parse_bind_arg_errors(arg, message):
 
 def test_binds_file_yaml(tmp_path):
     path = tmp_path / "b.yaml"
-    path.write_text('ID: 5\nd: 2024-01-02\nname: "01234"\nnothing: null\n"amt:decimal": "12.50"\n')
+    path.write_text('ID: 5\nd: 2024-01-02\n"hired:date": 2024-01-02\nname: "01234"\nflag: off\n'
+                    'nothing: null\n"amt:decimal": "12.50"\n')
+    # YAML 1.2: an unquoted date and off stay text; a :date type makes a date.
     assert load_binds_file(path) == {
-        "id": 5, "d": date(2024, 1, 2), "name": "01234",
+        "id": 5, "d": "2024-01-02", "hired": date(2024, 1, 2), "name": "01234", "flag": "off",
         "nothing": None, "amt": Decimal("12.50"),
     }
 

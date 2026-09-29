@@ -9,9 +9,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Any, NoReturn
 
-import yaml
-
-from dprobe import tty
+from dprobe import tty, yaml12
 from dprobe.errors import ConfigError, DprobeError, register_secret
 
 CONFIG_ENV = "DPROBE_CONFIG"
@@ -286,7 +284,7 @@ class _Validator:
                 self.fail(where, "is required")
             return None
         if not isinstance(value, str):
-            # YAML turns unquoted 1234, yes, 2024-01-01 into non-strings.
+            # Unquoted 1234, 7.4 or true aren't strings in YAML.
             self.fail(where, f"must be a string; put {value!r} in quotes")
         return value
 
@@ -349,8 +347,8 @@ def _parse_connection(v: _Validator, label: str, raw: Any) -> ConnectionConfig:
 
 def _read_yaml(path: Path) -> Any:
     try:
-        return yaml.safe_load(read_utf8(path, ConfigError))
-    except yaml.YAMLError as e:
+        return yaml12.load(read_utf8(path, ConfigError))
+    except yaml12.YAMLError as e:
         raise ConfigError(f"{path}: invalid YAML: {e}") from e
 
 

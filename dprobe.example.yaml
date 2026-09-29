@@ -1,5 +1,7 @@
 # Copy to dprobe.yaml (git-ignored) or ~/.config/dprobe/config.yaml.
-# chmod 600 it if it holds plaintext passwords.
+# A plaintext password is allowed; ${VAR} reads one from the environment instead.
+# dprobe.override.yaml beside it, if present, is merged over this file: a good
+# place for passwords (e.g. connections: {hr-prod: {password: ...}}).
 
 defaults:
   format: table        # table, csv, tsv, json, jsonl

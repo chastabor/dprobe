@@ -155,9 +155,9 @@ def test_query_table(db, capsys, tmp_path):
     assert captured.out == (
         "id  name  score\n"
         "--  ----  -----\n"
-        "1   Ann   9.5\n"
-        "2   Bo    NULL\n"
-        "3   Cy    7.0\n"
+        " 1  Ann     9.5\n"
+        " 2  Bo     NULL\n"
+        " 3  Cy      7.0\n"
     )
     assert captured.err.startswith("(3 rows, ")
 
@@ -179,7 +179,7 @@ def test_query_stdin_and_output_file(db, capsys, monkeypatch, tmp_path):
 def test_query_max_rows(db, capsys):
     assert main(["query", "web", "-e", "SELECT id FROM people ORDER BY id", "--max-rows", "2"]) == 0
     captured = capsys.readouterr()
-    assert captured.out.splitlines()[-1] == "2"
+    assert captured.out.splitlines()[-1] == " 2"
     assert captured.err.startswith("(first 2 rows, ") and "--max-rows 0 shows all" in captured.err
 
 
@@ -489,3 +489,38 @@ def test_keyring_command(write_config, capsys, monkeypatch, memory_keyring):
     assert memory.get_password("dprobe", "u") == "typed-secret"
     assert main(["keyring", "kr", "--delete"]) == 0
     assert memory.get_password("dprobe", "u") is None
+
+
+class RecordingConnector(SqliteConnector):
+    seen: list = []
+
+    def _connect_args(self):
+        self.seen.append((self.config.user, self.password))
+        return super()._connect_args()
+
+
+def test_password_from_an_environment_variable(db, write_config, monkeypatch, capsys):
+    write_config("connections:\n  env:\n    driver: mysql\n    url: h/d\n"
+                 "    user: ${WEB_USER}\n    password: ${WEB_PASS}\n", mode=0o644)
+    monkeypatch.setenv("WEB_USER", "app_ro")
+    monkeypatch.setenv("WEB_PASS", "s3cr3t-from-env")
+    monkeypatch.setitem(REGISTRY, "mysql", RecordingConnector)
+    monkeypatch.setattr(RecordingConnector, "seen", [])
+    assert main(["query", "env", "-f", "csv", "-e", "SELECT 1 AS x"]) == 0
+    captured = capsys.readouterr()
+    assert (captured.out, RecordingConnector.seen) == ("x\n1\n", [("app_ro", "s3cr3t-from-env")])
+    # A world-readable file is fine: no warning.
+    assert "warning" not in captured.err
+    monkeypatch.delenv("WEB_PASS")
+    assert main(["query", "env", "-e", "SELECT 1"]) == 2
+    assert "connections.env.password: environment variable WEB_PASS is not set" in capsys.readouterr().err
+
+
+def test_labels_with_an_override_file(write_config, capsys):
+    write_config(CONFIG)
+    write_config("connections:\n  web:\n    password: null\n    password_cmd: pass show web\n",
+                 name="dprobe.override.yaml")
+    assert main(["-v", "labels"]) == 0
+    captured = capsys.readouterr()
+    assert "web    mysql   web-db:3306/webapp  app_ro  command" in captured.out
+    assert "dprobe: using dprobe.yaml with dprobe.override.yaml" in captured.err

@@ -3,7 +3,6 @@
 import getpass
 import os
 import re
-import stat
 import subprocess
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field, replace
@@ -74,7 +73,7 @@ class Config:
     path: Path
     defaults: Defaults
     connections: Mapping[str, ConnectionConfig]
-    warnings: tuple[str, ...] = ()
+    override: Path | None = None  # the override file merged over path, if there was one
 
     def get(self, label: str) -> ConnectionConfig:
         try:
@@ -119,26 +118,43 @@ def read_utf8(path: Path, error: type[DprobeError]) -> str:
 
 
 def load_config(explicit: Path | None = None) -> Config:
+    """Load the config file, with its override file merged over it when there is one."""
     path = find_config(explicit)
-    try:
-        data = yaml.safe_load(read_utf8(path, ConfigError))
-    except yaml.YAMLError as e:
-        raise ConfigError(f"{path}: invalid YAML: {e}") from e
-    config = parse_config(data, path)
-    if _readable_by_others(path) and any(
-        c.auth_source == "password" for c in config.connections.values()
-    ):
-        warning = (
-            f"{path} contains plaintext passwords and is readable by other users; "
-            f"run: chmod 600 {path}"
-        )
-        config = replace(config, warnings=(*config.warnings, warning))
-    return config
+    data = _read_yaml(path)
+    override = override_path(path)
+    if not override.is_file():
+        return parse_config(data, path)
+    changes = _read_yaml(override)
+    if changes is not None and not isinstance(changes, dict):
+        raise ConfigError(f"{override}: expected a mapping, like the file it overrides")
+    return parse_config(merge(data, changes or {}), path, override)
 
 
-def parse_config(data: Any, path: Path) -> Config:
+def override_path(path: Path) -> Path:
+    """The file merged over path, as docker compose does: dprobe.yaml -> dprobe.override.yaml."""
+    return path.with_name(f"{path.stem}.override{path.suffix}")
+
+
+def merge(base: Any, changes: Any) -> Any:
+    """changes laid over base: mappings merge key by key, anything else replaces, and null removes the key.
+
+    So an override can set one connection's password, or swap password_cmd
+    for password with "password_cmd: null".
+    """
+    if not (isinstance(base, dict) and isinstance(changes, dict)):
+        return changes
+    merged = dict(base)
+    for key, value in changes.items():
+        if value is None:
+            merged.pop(key, None)
+        else:
+            merged[key] = merge(merged[key], value) if key in merged else value
+    return merged
+
+
+def parse_config(data: Any, path: Path, override: Path | None = None) -> Config:
     """Validate parsed YAML. url values holding ${VAR} are checked after expansion."""
-    v = _Validator(path)
+    v = _Validator(f"{path} with {override}" if override else str(path))
     top = v.mapping(data, "top level", _TOP_KEYS)
     defaults = _parse_defaults(v, top.get("defaults"))
     raw_connections = v.mapping(top.get("connections"), "connections")
@@ -149,7 +165,7 @@ def parse_config(data: Any, path: Path) -> Config:
         if not isinstance(label, str) or not label:
             v.fail("connections", f"label {label!r} must be a non-empty string")
         connections[label] = _parse_connection(v, label, entry)
-    return Config(path=path, defaults=defaults, connections=connections)
+    return Config(path=path, defaults=defaults, connections=connections, override=override)
 
 
 def parse_host_url(url: str) -> tuple[str, int | None, str | None]:
@@ -247,11 +263,11 @@ def _with_keyring(conn: ConnectionConfig, action: Callable[[Any], Any]) -> Any:
 
 
 class _Validator:
-    def __init__(self, path: Path) -> None:
-        self.path = path
+    def __init__(self, source: str) -> None:
+        self.source = source
 
     def fail(self, where: str, message: str) -> NoReturn:
-        raise ConfigError(f"{self.path}: {where}: {message}")
+        raise ConfigError(f"{self.source}: {where}: {message}")
 
     def mapping(self, value: Any, where: str, allowed: tuple[str, ...] | None = None) -> dict:
         if value is None:
@@ -331,6 +347,13 @@ def _parse_connection(v: _Validator, label: str, raw: Any) -> ConnectionConfig:
     )
 
 
+def _read_yaml(path: Path) -> Any:
+    try:
+        return yaml.safe_load(read_utf8(path, ConfigError))
+    except yaml.YAMLError as e:
+        raise ConfigError(f"{path}: invalid YAML: {e}") from e
+
+
 def _expand(value: Any, where: str) -> Any:
     if isinstance(value, str):
 
@@ -359,10 +382,6 @@ def _run_password_cmd(command: str, where: str) -> str:
     if not lines or not lines[0]:
         raise ConfigError(f"{where}.password_cmd printed no password")
     return lines[0]
-
-
-def _readable_by_others(path: Path) -> bool:
-    return bool(path.stat().st_mode & (stat.S_IRGRP | stat.S_IROTH))
 
 
 def _search_paths() -> list[Path]:

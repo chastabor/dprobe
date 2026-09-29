@@ -10,8 +10,6 @@ tests/compose.yaml starts all four with the labels in tests/it.example.yaml:
 import json
 import os
 import re
-import shutil
-import tempfile
 import time
 from contextlib import suppress
 from dataclasses import replace
@@ -26,19 +24,8 @@ from dprobe.connectors import create_connector
 from dprobe.errors import QueryError
 
 
-def _private_copy(path: str) -> Path:
-    """A 0600 copy of the config, made at import, before the fixtures change directory.
-
-    The committed example is world-readable, which would add a plaintext-password
-    warning to the stderr the tests check.
-    """
-    copy = Path(tempfile.mkdtemp()) / "it.yaml"
-    shutil.copy(Path(path).resolve(), copy)
-    copy.chmod(0o600)
-    return copy
-
-
-IT_CONFIG = _private_copy(os.environ["DPROBE_IT_CONFIG"]) if os.environ.get("DPROBE_IT_CONFIG") else None
+# Resolved at import: the autouse fixture changes the working directory.
+IT_CONFIG = Path(os.environ["DPROBE_IT_CONFIG"]).resolve() if os.environ.get("DPROBE_IT_CONFIG") else None
 
 pytestmark = pytest.mark.integration
 

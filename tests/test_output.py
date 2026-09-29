@@ -1,4 +1,5 @@
 import io
+import os
 import json
 import uuid
 from dataclasses import dataclass
@@ -7,7 +8,7 @@ from decimal import Decimal
 
 import pytest
 
-from dprobe.output import json_keys, json_value, text_value, write_result
+from dprobe.output import ResultWriter, display_width, json_keys, json_value, text_value, write_result
 
 
 @dataclass
@@ -36,11 +37,12 @@ def render(fmt, rows=ROWS, **kwargs):
 
 def test_table():
     text, count, more = render("table", null="NULL")
+    # Number columns are right-aligned.
     assert text == (
         "id  name   amount  since\n"
         "--  -----  ------  ----------\n"
-        "1   Ann    12.50   NULL\n"
-        "2   Bo\\tb  100     2024-01-02\n"
+        " 1  Ann     12.50  NULL\n"
+        " 2  Bo\\tb     100  2024-01-02\n"
     )
     assert (count, more) == (2, False)
 
@@ -112,3 +114,58 @@ def test_json_writes_utf8_not_escapes():
 
 def test_json_keys_unique():
     assert json_keys(["ID", "ID", "", "ID_2", ""]) == ["ID", "ID_2", "column3", "ID_2_2", "column5"]
+
+
+def test_display_width():
+    assert [display_width(t) for t in ["abc", "日本", "😀", "é", "e\u0301", "naïve ✓"]] == [3, 4, 2, 1, 1, 7]
+
+
+def test_table_aligns_wide_characters_and_mixed_columns():
+    rows = [("日本語", 1), ("ab", "x")]
+    out = io.StringIO()
+    write_result(FakeResult(["text", "mixed"], rows), "table", out)
+    # 日本語 takes six columns; a column holding a string isn't right-aligned.
+    assert out.getvalue() == "text    mixed\n------  -----\n日本語  1\nab      x\n"
+
+
+def test_table_fits_the_terminal():
+    rows = [(1, "x" * 60, "short"), (22, "y", None)]
+    out = io.StringIO()
+    write_result(FakeResult(["id", "note", "tag"], rows), "table", out, null="NULL", fit=30)
+    lines = out.getvalue().splitlines()
+    assert max(len(line) for line in lines) <= 30
+    # note gets 30 - (2 + 5 + 2 gaps of 2) = 19 columns.
+    assert lines[2] == " 1  " + "x" * 18 + "…  short"
+    # Too narrow for every column's minimum: columns stop shrinking and the terminal wraps.
+    out = io.StringIO()
+    write_result(FakeResult(["id", "note", "tag"], rows), "table", out, fit=5)
+    assert out.getvalue().splitlines()[2].startswith(" 1  xxxxx…")
+
+
+def test_table_clips_by_display_width():
+    out = io.StringIO()
+    write_result(FakeResult(["t"], [("日本語テキスト",)]), "table", out, max_width=6)
+    assert out.getvalue().splitlines()[2] == "日本…"
+
+
+def test_writer_fits_tables_only_on_a_terminal(monkeypatch):
+    import shutil
+
+    class Terminal(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr(shutil, "get_terminal_size", lambda: os.terminal_size((20, 24)))
+    rows = [(1, "x" * 40)]
+    on_terminal, piped = Terminal(), io.StringIO()
+    ResultWriter(lambda: on_terminal, "table").write(FakeResult(["id", "note"], rows))
+    ResultWriter(lambda: piped, "table").write(FakeResult(["id", "note"], rows))
+    assert max(len(line) for line in on_terminal.getvalue().splitlines()) == 20
+    assert max(len(line) for line in piped.getvalue().splitlines()) == 44
+
+
+def test_table_cut_counts_columns_not_characters():
+    # 12 characters but 6 columns: the early cut must not hide that the value was cut.
+    out = io.StringIO()
+    write_result(FakeResult(["t"], [("e\u0301" * 6 + "tail",)]), "table", out, max_width=5)
+    assert out.getvalue().splitlines()[2] == "e\u0301" * 4 + "…"

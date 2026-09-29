@@ -19,7 +19,7 @@ from dprobe.config import (
 from dprobe.connectors import REGISTRY, create_connector
 from dprobe.connectors.base import ColumnInfo, Connector, Found, IndexInfo, ResultColumn, SchemaInfo, TableInfo
 from dprobe.errors import DprobeError, QueryError, UsageError, redact
-from dprobe.output import ResultWriter, Table, format_table, text_value
+from dprobe.output import ResultWriter, Table, text_value
 from dprobe.sqltext import split_name
 
 
@@ -154,7 +154,8 @@ def cmd_labels(args: argparse.Namespace) -> int:
         (c.label, c.driver, c.url, c.user, c.auth_source, "yes" if c.readonly else None)
         for c in config.connections.values()
     ]
-    print(format_table(("label", "driver", "url", "user", "auth", "readonly"), rows))
+    columns = ["label", "driver", "url", "user", "auth", "readonly"]
+    ResultWriter(lambda: sys.stdout, "table", null="").write(Table(columns, rows))
     return 0
 
 
@@ -471,9 +472,8 @@ def _add_global_options(parser: argparse.ArgumentParser, *, in_subcommand: bool)
 def _load(args: argparse.Namespace) -> Config:
     config = load_config(args.config)
     if args.verbose:
-        print(f"dprobe: using {config.path}", file=sys.stderr)
-    for warning in config.warnings:
-        print(f"dprobe: warning: {warning}", file=sys.stderr)
+        also = f" with {config.override}" if config.override else ""
+        print(f"dprobe: using {config.path}{also}", file=sys.stderr)
     return config
 
 

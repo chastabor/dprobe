@@ -21,7 +21,6 @@ def test_load_basic(write_config):
     assert (web.driver, web.url, web.user, web.readonly) == ("mysql", "web-db:3306/webapp", "app_ro", False)
     assert web.password == "${WEB_PASS}"
     assert config.defaults.format == "table"
-    assert config.warnings == ()
 
 
 def test_search_order(write_config, tmp_path, monkeypatch):
@@ -102,13 +101,11 @@ def test_parse_host_url(url, parts):
     assert parse_host_url(url) == parts
 
 
-def test_plaintext_password_warning(write_config):
+def test_plaintext_password_in_a_readable_file(write_config):
+    # Some setups keep passwords in the file; that's allowed, whatever the file's permissions.
     text = "connections:\n  a:\n    driver: oracle\n    url: x\n    user: u\n    password: hunter22\n"
-    assert load_config(write_config(text, mode=0o600)).warnings == ()
-    (warning,) = load_config(write_config(text, mode=0o644)).warnings
-    assert "chmod 600" in warning
-    # Env references aren't plaintext.
-    assert load_config(write_config(BASIC, mode=0o644)).warnings == ()
+    conn = load_config(write_config(text, mode=0o644)).get("a")
+    assert (conn.auth_source, resolve_password(conn.expand_env())) == ("password", "hunter22")
 
 
 def test_config_must_be_utf8(tmp_path):
@@ -200,3 +197,75 @@ def test_keyring_without_backend(monkeypatch):
 def test_keyring_config_errors(write_config, entry, message):
     with pytest.raises(ConfigError, match=message):
         load_config(write_config(f"connections:\n  web:\n    {entry}\n"))
+
+
+OVERRIDDEN = """
+    defaults: {max_rows: 50}
+    connections:
+      web:
+        driver: mysql
+        url: web-db:3306/webapp
+        user: app_ro
+        password_cmd: secret-tool lookup db web
+        options: {ssl_disabled: false, connection_timeout: 5}
+      old:
+        driver: oracle
+        url: db1:1521/ORCL
+"""
+
+
+def test_override_file_is_merged(write_config):
+    path = write_config(OVERRIDDEN)
+    override = write_config("""
+        connections:
+          web:
+            password_cmd: null
+            password: from-override
+            options: {connection_timeout: 30}
+          old: null
+          new: {driver: mssql, url: sql1/db}
+    """, name="dprobe.override.yaml")
+    config = load_config(path)
+    web = config.get("web")
+    assert (web.password, web.password_cmd, web.user) == ("from-override", None, "app_ro")
+    # Mappings merge key by key; null removes a key, here a whole connection.
+    assert web.options == {"ssl_disabled": False, "connection_timeout": 30}
+    assert list(config.connections) == ["web", "new"]
+    assert (config.defaults.max_rows, config.override) == (50, override)
+
+
+def test_override_follows_the_config_file_name(write_config):
+    from dprobe.config import override_path
+
+    assert override_path(Path("tests/it.example.yaml")) == Path("tests/it.example.override.yaml")
+    assert override_path(Path("config.yml")) == Path("config.override.yml")
+    path = write_config(OVERRIDDEN, name="it.example.yaml")
+    write_config("connections:\n  web:\n    user: someone\n", name="it.example.override.yaml")
+    assert load_config(path).get("web").user == "someone"
+    # Without an override file, the config loads as it is.
+    assert load_config(write_config(OVERRIDDEN, name="plain.yaml")).override is None
+
+
+def test_override_errors_name_both_files(write_config):
+    path = write_config(OVERRIDDEN)
+    write_config("connections:\n  web:\n    password: secret\n", name="dprobe.override.yaml")
+    # The base's password_cmd and the override's password clash after merging.
+    with pytest.raises(ConfigError, match=r"dprobe\.yaml with .*dprobe\.override\.yaml: connections\.web: set only one"):
+        load_config(path)
+    write_config("- not a mapping\n", name="dprobe.override.yaml")
+    with pytest.raises(ConfigError, match=r"dprobe\.override\.yaml: expected a mapping"):
+        load_config(path)
+    write_config("connections: [\n", name="dprobe.override.yaml")
+    with pytest.raises(ConfigError, match=r"dprobe\.override\.yaml: invalid YAML"):
+        load_config(path)
+    write_config("", name="dprobe.override.yaml")
+    assert load_config(path).get("web").password_cmd == "secret-tool lookup db web"
+
+
+def test_merge():
+    from dprobe.config import merge
+
+    assert merge({"a": {"b": 1, "c": 2}, "d": [1]}, {"a": {"c": 3, "e": 4}, "d": [2]}) == {
+        "a": {"b": 1, "c": 3, "e": 4}, "d": [2]}
+    assert merge({"a": 1, "b": 2}, {"a": None}) == {"b": 2}
+    assert merge({"a": {"b": 1}}, {"a": "x"}) == {"a": "x"}

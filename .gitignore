@@ -9,5 +9,7 @@ wheels/
 # Virtual environments
 .venv
 
-# Local connection config (may hold credentials)
+# Local connection config and overrides (may hold credentials)
 dprobe.yaml
+*.override.yaml
+*.override.yml
